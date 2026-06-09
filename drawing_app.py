@@ -745,12 +745,16 @@ class DrawingCanvas(tk.Canvas):
         on_rects_change: Callable[[], None],
         get_new_rect_color: Callable[[], str],
         on_pick_color: Callable[[str], None],
+        is_on_layer_draw: Callable[[], bool],
+        on_layer_draw_complete: Callable[[], None],
     ) -> None:
         super().__init__(master, highlightthickness=1)
         self.on_selection_change = on_selection_change
         self.on_rects_change = on_rects_change
         self.get_new_rect_color = get_new_rect_color
         self.on_pick_color = on_pick_color
+        self.is_on_layer_draw = is_on_layer_draw
+        self.on_layer_draw_complete = on_layer_draw_complete
         self.theme = LIGHT_THEME
 
         self.rectangles: list[Rectangle] = []
@@ -878,6 +882,17 @@ class DrawingCanvas(tk.Canvas):
 
     def _sorted_rects(self) -> list[Rectangle]:
         return sorted(self.rectangles, key=lambda r: r.z_index)
+
+    def _z_index_above(self, ref_id: int) -> int:
+        selected = next(r for r in self.rectangles if r.id == ref_id)
+        target = selected.z_index + 1
+        for rect in self.rectangles:
+            if rect.z_index >= target:
+                rect.z_index += 1
+        return target
+
+    def _next_top_z_index(self) -> int:
+        return max((r.z_index for r in self.rectangles), default=0) + 1
 
     def _hit_handle(self, rect: Rectangle, sx: float, sy: float) -> Optional[str]:
         for name, (hx, hy) in rect.handle_positions().items():
@@ -1035,6 +1050,9 @@ class DrawingCanvas(tk.Canvas):
                 self._preview_id = None
             w, h = abs(x2 - x1), abs(y2 - y1)
             if w >= MIN_RECT_SIZE and h >= MIN_RECT_SIZE:
+                ref_id = self.selected_id
+                on_layer = self.is_on_layer_draw() and ref_id is not None
+                z_index = self._z_index_above(ref_id) if on_layer else self._next_top_z_index()
                 rect = Rectangle(
                     id=self._next_id,
                     name=f"rect{self._next_name}",
@@ -1043,13 +1061,15 @@ class DrawingCanvas(tk.Canvas):
                     width=w,
                     height=h,
                     color=self.get_new_rect_color(),
-                    z_index=len(self.rectangles) + 1,
+                    z_index=z_index,
                 )
                 self._next_id += 1
                 self._next_name += 1
                 self.rectangles.append(rect)
                 self.select(rect.id)
                 self.on_rects_change()
+                if on_layer:
+                    self.on_layer_draw_complete()
             self._draw_start = None
 
         self._drag_mode = None
@@ -1172,6 +1192,8 @@ class DrawingApp:
 
         self._picker_button_active = False
         self._alt_held = False
+        self._on_layer_button_armed = False
+        self._ctrl_held = False
         self._show_canvas_only_active = False
         self._dark_mode = False
         self.theme = LIGHT_THEME
@@ -1211,6 +1233,15 @@ class DrawingApp:
         )
         self.show_canvas_btn.pack(side="left", padx=4)
 
+        self.on_layer_btn = tk.Button(
+            self.toolbar,
+            text="On Layer (Ctrl)",
+            command=self._on_on_layer_arm,
+            font=("Segoe UI", 9),
+            state="disabled",
+        )
+        self.on_layer_btn.pack(side="left", padx=4)
+
         self.dark_mode_btn = tk.Button(
             self.toolbar,
             text="Dark Mode",
@@ -1229,6 +1260,8 @@ class DrawingApp:
             on_rects_change=self._on_rects_change,
             get_new_rect_color=self.palette.get_color,
             on_pick_color=self._on_pick_color,
+            is_on_layer_draw=self._is_on_layer_draw,
+            on_layer_draw_complete=self._on_layer_draw_complete,
         )
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
@@ -1236,6 +1269,10 @@ class DrawingApp:
         self.root.bind_all("<Alt_R>", self._on_alt_press)
         self.root.bind_all("<KeyRelease-Alt_L>", self._on_alt_release)
         self.root.bind_all("<KeyRelease-Alt_R>", self._on_alt_release)
+        self.root.bind_all("<Control_L>", self._on_ctrl_press)
+        self.root.bind_all("<Control_R>", self._on_ctrl_press)
+        self.root.bind_all("<KeyRelease-Control_L>", self._on_ctrl_release)
+        self.root.bind_all("<KeyRelease-Control_R>", self._on_ctrl_release)
         self.root.bind_all("<Tab>", self._on_tab_press)
 
         self.layers = LayerPanel(
@@ -1267,6 +1304,9 @@ class DrawingApp:
         rect = self.canvas.get_selected()
         self.layers.set_rectangles(self.canvas.rectangles, rect_id)
         self.layers.delete_btn.config(state="normal" if rect_id is not None else "disabled")
+        if rect_id is None:
+            self._on_layer_button_armed = False
+        self._update_on_layer_mode()
         if rect and not self._syncing_color:
             self._syncing_color = True
             self.palette.set_color(rect.color)
@@ -1305,6 +1345,40 @@ class DrawingApp:
     def _on_alt_release(self, _event: tk.Event) -> None:
         self._alt_held = False
         self._update_picker_mode()
+
+    def _is_on_layer_draw(self) -> bool:
+        if self.canvas.selected_id is None:
+            return False
+        return self._on_layer_button_armed or self._ctrl_held
+
+    def _update_on_layer_mode(self) -> None:
+        has_selection = self.canvas.selected_id is not None
+        active = self._is_on_layer_draw()
+        self.on_layer_btn.config(
+            state="normal" if has_selection else "disabled",
+            relief=tk.SUNKEN if active else tk.RAISED,
+        )
+
+    def _on_on_layer_arm(self) -> None:
+        if self.canvas.selected_id is None:
+            return
+        self._on_layer_button_armed = True
+        self._update_on_layer_mode()
+
+    def _on_layer_draw_complete(self) -> None:
+        self._on_layer_button_armed = False
+        self._update_on_layer_mode()
+
+    def _on_ctrl_press(self, event: tk.Event) -> Optional[str]:
+        if isinstance(event.widget, tk.Entry):
+            return None
+        self._ctrl_held = True
+        self._update_on_layer_mode()
+        return "break"
+
+    def _on_ctrl_release(self, _event: tk.Event) -> None:
+        self._ctrl_held = False
+        self._update_on_layer_mode()
 
     def _on_pick_color(self, hex_color: str) -> None:
         self._syncing_color = True
@@ -1358,8 +1432,9 @@ class DrawingApp:
             label.config(bg=self.theme.app_bg, fg=self.theme.text)
         for entry in (self.width_entry, self.height_entry):
             _style_entry(entry, self.theme)
-        for btn in (self.show_canvas_btn, self.dark_mode_btn):
+        for btn in (self.show_canvas_btn, self.on_layer_btn, self.dark_mode_btn):
             _style_button(btn, self.theme)
+        self._update_on_layer_mode()
         self.dark_mode_btn.config(
             text="Light Mode" if self._dark_mode else "Dark Mode",
             relief=tk.SUNKEN if self._dark_mode else tk.RAISED,
