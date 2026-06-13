@@ -1,4 +1,4 @@
-"""Rectangle drawing tool — run with: python main.py"""
+"""Drawing tool — run with: python main.py"""
 
 from drawing_app import DrawingApp
 

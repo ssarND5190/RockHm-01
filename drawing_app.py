@@ -1,14 +1,67 @@
-"""Vector rectangle drawing tool with color palette, canvas, and layer panel."""
+"""Vector drawing tool with color palette, canvas, and layer panel."""
 
 from __future__ import annotations
 
 import colorsys
+import ctypes
+import json
 import math
+import queue
 import tkinter as tk
 from dataclasses import dataclass, replace
+from pathlib import Path
+from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
 from PIL import Image, ImageTk
+
+from draw_objects import (
+    DEFAULT_LINE_WIDTH,
+    DrawObject,
+    DrawTool,
+    Line,
+    MAX_LINE_WIDTH,
+    MIN_LINE_LENGTH,
+    MIN_LINE_WIDTH,
+    MIN_RECT_SIZE,
+    MIN_TRIANGLE_AREA,
+    Rectangle,
+    Triangle,
+    intersects_paint_canvas,
+    next_top_z_index,
+    sorted_shapes,
+    triangle_area,
+    z_index_above,
+)
+from drawing_file import (
+    FILE_EXTENSION,
+    LoadedDocument,
+    build_document,
+    file_dialog_types,
+    load_document,
+    save_document,
+)
+
+try:
+    import windnd
+
+    _HAS_FILE_DROP = True
+except ImportError:
+    _HAS_FILE_DROP = False
+
+_FILE_DROP_QUEUE: queue.Queue[list] = queue.Queue()
+_PYTHONAPI = ctypes.pythonapi
+_PYTHONAPI.PyGILState_Ensure.restype = ctypes.c_void_p
+_PYTHONAPI.PyGILState_Release.argtypes = [ctypes.c_void_p]
+
+
+def _enqueue_dropped_files(files: list) -> None:
+    """Called from the Windows WndProc; must acquire the GIL before touching Python."""
+    gil_state = _PYTHONAPI.PyGILState_Ensure()
+    try:
+        _FILE_DROP_QUEUE.put(list(files))
+    finally:
+        _PYTHONAPI.PyGILState_Release(gil_state)
 
 
 HANDLE_RADIUS = 4
@@ -19,7 +72,6 @@ HANDLE_HOVER_FILL = "#404040"
 HANDLE_OUTLINE = "#333333"
 HANDLE_TEXT = "#333333"
 DRAW_PREVIEW_OUTLINE = "#666666"
-MIN_RECT_SIZE = 4
 MIN_ZOOM = 0.1
 MAX_ZOOM = 8.0
 ZOOM_FACTOR = 1.1
@@ -127,6 +179,24 @@ def _style_button(btn: tk.Button, theme: Theme) -> None:
     )
 
 
+def _style_menubutton(btn: tk.Menubutton, theme: Theme) -> None:
+    btn.config(
+        bg=theme.button_bg,
+        fg=theme.button_fg,
+        activebackground=theme.button_active_bg,
+        activeforeground=theme.button_fg,
+    )
+
+
+def _style_menu(menu: tk.Menu, theme: Theme) -> None:
+    menu.config(
+        bg=theme.button_bg,
+        fg=theme.button_fg,
+        activebackground=theme.button_active_bg,
+        activeforeground=theme.button_fg,
+    )
+
+
 def _style_entry(entry: tk.Entry, theme: Theme) -> None:
     entry.config(bg=theme.entry_bg, fg=theme.entry_fg, insertbackground=theme.entry_fg)
 
@@ -149,56 +219,6 @@ class PaintCanvas:
     def corners(self) -> list[tuple[float, float]]:
         x1, y1, x2, y2 = self.bounds()
         return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-
-
-@dataclass
-class Rectangle:
-    id: int
-    name: str
-    cx: float
-    cy: float
-    width: float
-    height: float
-    rotation: float = 0.0
-    color: str = "#4a90d9"
-    z_index: int = 0
-
-    def corners(self) -> list[tuple[float, float]]:
-        hw, hh = self.width / 2, self.height / 2
-        local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
-        rad = math.radians(self.rotation)
-        cos_a, sin_a = math.cos(rad), math.sin(rad)
-        return [
-            (self.cx + x * cos_a - y * sin_a, self.cy + x * sin_a + y * cos_a)
-            for x, y in local
-        ]
-
-    def contains_point(self, px: float, py: float) -> bool:
-        rad = math.radians(-self.rotation)
-        cos_a, sin_a = math.cos(rad), math.sin(rad)
-        dx, dy = px - self.cx, py - self.cy
-        lx = dx * cos_a - dy * sin_a
-        ly = dx * sin_a + dy * cos_a
-        return abs(lx) <= self.width / 2 and abs(ly) <= self.height / 2
-
-    def handle_positions(self) -> dict[str, tuple[float, float]]:
-        corners = self.corners()
-        mid = lambda a, b: ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-        top_mid = mid(corners[0], corners[1])
-        rad = math.radians(self.rotation - 90)
-        rot_x = top_mid[0] + ROTATION_HANDLE_OFFSET * math.cos(rad)
-        rot_y = top_mid[1] + ROTATION_HANDLE_OFFSET * math.sin(rad)
-        return {
-            "nw": corners[0],
-            "n": mid(corners[0], corners[1]),
-            "ne": corners[1],
-            "e": mid(corners[1], corners[2]),
-            "se": corners[2],
-            "s": mid(corners[2], corners[3]),
-            "sw": corners[3],
-            "w": mid(corners[3], corners[0]),
-            "rotate": (rot_x, rot_y),
-        }
 
 
 def rgb_to_hex(r: int, g: int, b: int) -> str:
@@ -327,9 +347,11 @@ class ColorPalette(tk.Frame):
         master: tk.Misc,
         on_color_change: Callable[[str], None],
         on_picker_toggle: Callable[[], None],
+        on_line_width_change: Callable[[float], None],
     ) -> None:
         super().__init__(master, bg=LIGHT_THEME.panel_bg, width=220)
         self.on_color_change = on_color_change
+        self.on_line_width_change = on_line_width_change
         self._updating = False
         self.theme = LIGHT_THEME
 
@@ -405,6 +427,19 @@ class ColorPalette(tk.Frame):
         self.sliders["h"].set_gradient(
             lambda t: tuple(int(c * 255) for c in colorsys.hsv_to_rgb(t, 1, 1))
         )
+
+        self.line_width_slider = GradientSlider(
+            self,
+            label="W",
+            from_=MIN_LINE_WIDTH,
+            to_=MAX_LINE_WIDTH,
+            on_change=lambda v: self._on_line_width_slider(float(v)),
+        )
+        self.line_width_slider.set_gradient(
+            lambda t: (int(t * 180), int(t * 180), int(t * 180))
+        )
+        self.line_width_slider.set_value(DEFAULT_LINE_WIDTH)
+
         self._build_wheel_image()
         self._refresh_sv_square()
         self._update_markers()
@@ -422,6 +457,7 @@ class ColorPalette(tk.Frame):
         _style_button(self.picker_btn, theme)
         for slider in self.sliders.values():
             slider.apply_theme(theme)
+        self.line_width_slider.apply_theme(theme)
         self._cached_hue = None
         self._build_wheel_image()
         self._refresh_sv_square()
@@ -443,6 +479,18 @@ class ColorPalette(tk.Frame):
 
     def set_picker_active(self, active: bool) -> None:
         self.picker_btn.config(relief=tk.SUNKEN if active else tk.RAISED)
+
+    def set_line_width_controls_visible(self, visible: bool) -> None:
+        if visible:
+            self.line_width_slider.pack(fill="x", padx=10, pady=(0, 6))
+        else:
+            self.line_width_slider.pack_forget()
+
+    def set_line_width_value(self, width: float) -> None:
+        self.line_width_slider.set_value(width)
+
+    def _on_line_width_slider(self, value: float) -> None:
+        self.on_line_width_change(value)
 
     def _emit_color(self) -> None:
         if self._updating:
@@ -643,7 +691,7 @@ class LayerPanel(tk.Frame):
 
         self.on_select = on_select
         self.on_reorder = on_reorder
-        self._rects: list[Rectangle] = []
+        self._shapes: list[DrawObject] = []
         self._selected_id: Optional[int] = None
         self._rows: dict[int, tuple[tk.Frame, tk.Canvas, tk.Label]] = {}
         self._layer_order: list[int] = []
@@ -657,21 +705,21 @@ class LayerPanel(tk.Frame):
         for btn in (self.up_btn, self.down_btn, self.delete_btn):
             _style_button(btn, theme)
         self._list_container.config(bg=theme.list_bg, highlightbackground=theme.list_border)
-        if self._rects:
-            self.set_rectangles(self._rects, self._selected_id)
+        if self._shapes:
+            self.set_shapes(self._shapes, self._selected_id)
 
-    def set_rectangles(self, rects: list[Rectangle], selected_id: Optional[int]) -> None:
-        self._rects = sorted(rects, key=lambda r: r.z_index, reverse=True)
+    def set_shapes(self, shapes: list[DrawObject], selected_id: Optional[int]) -> None:
+        self._shapes = sorted(shapes, key=lambda shape: shape.z_index, reverse=True)
         self._selected_id = selected_id
-        order = [rect.id for rect in self._rects]
+        order = [shape.id for shape in self._shapes]
 
         if order == self._layer_order and self._rows:
-            for rect in self._rects:
-                row, swatch, label = self._rows[rect.id]
-                swatch.configure(bg=rect.color)
+            for shape in self._shapes:
+                row, swatch, label = self._rows[shape.id]
+                swatch.configure(bg=shape.color)
                 bg = (
                     self.theme.layer_selected
-                    if rect.id == selected_id
+                    if shape.id == selected_id
                     else self.theme.layer_normal
                 )
                 row.configure(bg=bg)
@@ -683,8 +731,8 @@ class LayerPanel(tk.Frame):
         self._rows.clear()
         self._layer_order = order
 
-        for rect in self._rects:
-            is_selected = rect.id == selected_id
+        for shape in self._shapes:
+            is_selected = shape.id == selected_id
             row_bg = self.theme.layer_selected if is_selected else self.theme.layer_normal
             row = tk.Frame(self._list_container, bg=row_bg, cursor="hand2")
             row.pack(fill="x", pady=1)
@@ -692,15 +740,15 @@ class LayerPanel(tk.Frame):
                 row,
                 width=14,
                 height=14,
-                bg=rect.color,
+                bg=shape.color,
                 highlightthickness=1,
                 highlightbackground=self.theme.swatch_border,
             )
             swatch.pack(side="left", padx=(6, 6), pady=4)
-            swatch.bind("<Button-1>", lambda _e, rid=rect.id: self.on_select(rid))
+            swatch.bind("<Button-1>", lambda _e, sid=shape.id: self.on_select(sid))
             label = tk.Label(
                 row,
-                text=rect.name,
+                text=shape.name,
                 anchor="w",
                 bg=row_bg,
                 fg=self.theme.text,
@@ -709,13 +757,16 @@ class LayerPanel(tk.Frame):
             )
             label.pack(side="left", fill="x", expand=True)
             for widget in (row, label):
-                widget.bind("<Button-1>", lambda _e, rid=rect.id: self.on_select(rid))
-            self._rows[rect.id] = (row, swatch, label)
+                widget.bind("<Button-1>", lambda _e, sid=shape.id: self.on_select(sid))
+            self._rows[shape.id] = (row, swatch, label)
+
+    def set_rectangles(self, shapes: list[DrawObject], selected_id: Optional[int]) -> None:
+        self.set_shapes(shapes, selected_id)
 
     def _selected_index(self) -> Optional[int]:
         if self._selected_id is None:
             return None
-        for i, rect in enumerate(self._rects):
+        for i, rect in enumerate(self._shapes):
             if rect.id == self._selected_id:
                 return i
         return None
@@ -725,9 +776,9 @@ class LayerPanel(tk.Frame):
         if idx is None:
             return
         new_idx = idx + direction
-        if new_idx < 0 or new_idx >= len(self._rects):
+        if new_idx < 0 or new_idx >= len(self._shapes):
             return
-        ordered = list(self._rects)
+        ordered = list(self._shapes)
         ordered[idx], ordered[new_idx] = ordered[new_idx], ordered[idx]
         base = len(ordered)
         for i, rect in enumerate(ordered):
@@ -736,7 +787,7 @@ class LayerPanel(tk.Frame):
 
 
 class DrawingCanvas(tk.Canvas):
-    """Center canvas: draw, select, resize, move, and rotate rectangles."""
+    """Center canvas: draw, select, and edit shapes."""
 
     def __init__(
         self,
@@ -757,17 +808,23 @@ class DrawingCanvas(tk.Canvas):
         self.on_layer_draw_complete = on_layer_draw_complete
         self.theme = LIGHT_THEME
 
-        self.rectangles: list[Rectangle] = []
+        self.shapes: list[DrawObject] = []
+        self.draw_tool: DrawTool = "rectangle"
         self._picker_mode = False
         self._next_id = 1
-        self._next_name = 1
+        self._next_rect_name = 1
+        self._next_line_name = 1
+        self._next_triangle_name = 1
+        self._next_line_width = DEFAULT_LINE_WIDTH
         self.selected_id: Optional[int] = None
 
         self._drag_mode: Optional[str] = None
         self._drag_start: Optional[tuple[float, float]] = None
-        self._drag_rect_snapshot: Optional[Rectangle] = None
+        self._drag_snapshot: Optional[DrawObject] = None
         self._draw_start: Optional[tuple[float, float]] = None
         self._preview_id: Optional[int] = None
+        self._preview_ids: list[int] = []
+        self._triangle_vertices: list[tuple[float, float]] = []
 
         self._scale = 1.0
         self._offset_x = 0.0
@@ -823,33 +880,145 @@ class DrawingCanvas(tk.Canvas):
         self._offset_y = my - wy * new_scale
         self._redraw()
 
-    def get_selected(self) -> Optional[Rectangle]:
+    def set_draw_tool(self, tool: DrawTool) -> None:
+        if tool != self.draw_tool:
+            self._cancel_triangle_draw()
+        self.draw_tool = tool
+
+    def _cancel_triangle_draw(self) -> None:
+        self._triangle_vertices.clear()
+        self._clear_draw_previews()
+
+    def _clear_draw_previews(self) -> None:
+        if self._preview_id is not None:
+            self.delete(self._preview_id)
+            self._preview_id = None
+        for pid in self._preview_ids:
+            self.delete(pid)
+        self._preview_ids.clear()
+
+    def _show_triangle_build_preview(
+        self, cursor_sx: Optional[float] = None, cursor_sy: Optional[float] = None
+    ) -> None:
+        self._clear_draw_previews()
+        verts = self._triangle_vertices
+        if not verts:
+            return
+
+        for wx, wy in verts:
+            sx, sy = self._world_to_screen(wx, wy)
+            pid = self.create_oval(
+                sx - 4,
+                sy - 4,
+                sx + 4,
+                sy + 4,
+                outline=DRAW_PREVIEW_OUTLINE,
+                fill="",
+                width=1,
+            )
+            self._preview_ids.append(pid)
+
+        screen_verts = [self._world_to_screen(wx, wy) for wx, wy in verts]
+        if len(screen_verts) >= 2 and cursor_sx is None:
+            x1, y1 = screen_verts[0]
+            x2, y2 = screen_verts[1]
+            pid = self.create_line(
+                x1, y1, x2, y2, fill=DRAW_PREVIEW_OUTLINE, dash=(4, 4), width=1
+            )
+            self._preview_ids.append(pid)
+
+        if len(screen_verts) == 2 and cursor_sx is not None and cursor_sy is not None:
+            x1, y1 = screen_verts[0]
+            x2, y2 = screen_verts[1]
+            for ax, ay, bx, by in (
+                (x1, y1, x2, y2),
+                (x2, y2, cursor_sx, cursor_sy),
+                (cursor_sx, cursor_sy, x1, y1),
+            ):
+                pid = self.create_line(
+                    ax, ay, bx, by, fill=DRAW_PREVIEW_OUTLINE, dash=(4, 4), width=1
+                )
+                self._preview_ids.append(pid)
+
+    def _add_triangle_vertex(self, wx: float, wy: float) -> None:
+        self._triangle_vertices.append((wx, wy))
+        if len(self._triangle_vertices) < 3:
+            self._show_triangle_build_preview()
+            return
+
+        (x1, y1), (x2, y2), (x3, y3) = self._triangle_vertices
+        if triangle_area(x1, y1, x2, y2, x3, y3) < MIN_TRIANGLE_AREA:
+            self._triangle_vertices = [(wx, wy)]
+            self._show_triangle_build_preview()
+            return
+
+        ref_id = self.selected_id
+        on_layer = self.is_on_layer_draw() and ref_id is not None
+        z_index = z_index_above(self.shapes, ref_id) if on_layer else next_top_z_index(self.shapes)
+        tri = Triangle(
+            id=self._next_id,
+            name=f"tri{self._next_triangle_name}",
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            x3=x3,
+            y3=y3,
+            color=self.get_new_rect_color(),
+            z_index=z_index,
+        )
+        self._next_id += 1
+        self._next_triangle_name += 1
+        self.shapes.append(tri)
+        self._triangle_vertices.clear()
+        self._clear_draw_previews()
+        self.select(tri.id)
+        self.on_rects_change()
+        if on_layer:
+            self.on_layer_draw_complete()
+        self._redraw()
+
+    def get_selected(self) -> Optional[DrawObject]:
         if self.selected_id is None:
             return None
-        return next((r for r in self.rectangles if r.id == self.selected_id), None)
+        return next((shape for shape in self.shapes if shape.id == self.selected_id), None)
 
-    def select(self, rect_id: Optional[int]) -> None:
-        self.selected_id = rect_id
+    def select(self, shape_id: Optional[int]) -> None:
+        self.selected_id = shape_id
         self._hovered_handle = None
+        shape = self.get_selected()
+        if isinstance(shape, Line):
+            self._next_line_width = shape.stroke_width
         self._redraw()
-        self.on_selection_change(rect_id)
+        self.on_selection_change(shape_id)
 
     def _handle_hit_radius(self, name: str) -> float:
         if name == "rotate":
             return ROTATION_HANDLE_RADIUS + 8
+        if name == "move":
+            return HANDLE_RADIUS + 10
         return HANDLE_RADIUS + 8
 
     def set_color(self, hex_color: str) -> None:
-        rect = self.get_selected()
-        if rect:
-            rect.color = hex_color
+        shape = self.get_selected()
+        if shape:
+            shape.color = hex_color
+            self._redraw()
+            self.on_rects_change()
+
+    def set_line_width(self, width: float) -> None:
+        width = clamp(width, MIN_LINE_WIDTH, MAX_LINE_WIDTH)
+        self._next_line_width = width
+        shape = self.get_selected()
+        if isinstance(shape, Line):
+            shape.stroke_width = width
             self._redraw()
             self.on_rects_change()
 
     def delete_selected(self) -> None:
         if self.selected_id is None:
             return
-        self.rectangles = [r for r in self.rectangles if r.id != self.selected_id]
+        self.shapes = [shape for shape in self.shapes if shape.id != self.selected_id]
         self.select(None)
         self.on_rects_change()
 
@@ -866,36 +1035,33 @@ class DrawingCanvas(tk.Canvas):
         self.show_canvas_only = active
         self._redraw()
 
+    def import_document(self, doc: LoadedDocument) -> None:
+        self._cancel_triangle_draw()
+        self.shapes = list(doc.shapes)
+        self.paint_canvas.cx = doc.paint_canvas["cx"]
+        self.paint_canvas.cy = doc.paint_canvas["cy"]
+        self.paint_canvas.width = doc.paint_canvas["width"]
+        self.paint_canvas.height = doc.paint_canvas["height"]
+        self._next_id = doc.next_id
+        self._next_rect_name = doc.next_rect_name
+        self._next_line_name = doc.next_line_name
+        self._next_triangle_name = doc.next_triangle_name
+        self._next_line_width = doc.next_line_width
+        self.draw_tool = doc.draw_tool
+        self.select(doc.selected_id)
+
     def apply_theme(self, theme: Theme) -> None:
         self.theme = theme
         self.config(bg=theme.canvas_bg, highlightbackground=theme.canvas_border)
         self._redraw()
 
-    def _rect_intersects_paint_canvas(self, rect: Rectangle) -> bool:
-        px1, py1, px2, py2 = self.paint_canvas.bounds()
-        corners = rect.corners()
-        rx1 = min(c[0] for c in corners)
-        ry1 = min(c[1] for c in corners)
-        rx2 = max(c[0] for c in corners)
-        ry2 = max(c[1] for c in corners)
-        return not (rx2 < px1 or rx1 > px2 or ry2 < py1 or ry1 > py2)
+    def _should_draw_shape(self, shape: DrawObject) -> bool:
+        if not self.show_canvas_only:
+            return True
+        return intersects_paint_canvas(shape, self.paint_canvas.bounds())
 
-    def _sorted_rects(self) -> list[Rectangle]:
-        return sorted(self.rectangles, key=lambda r: r.z_index)
-
-    def _z_index_above(self, ref_id: int) -> int:
-        selected = next(r for r in self.rectangles if r.id == ref_id)
-        target = selected.z_index + 1
-        for rect in self.rectangles:
-            if rect.z_index >= target:
-                rect.z_index += 1
-        return target
-
-    def _next_top_z_index(self) -> int:
-        return max((r.z_index for r in self.rectangles), default=0) + 1
-
-    def _hit_handle(self, rect: Rectangle, sx: float, sy: float) -> Optional[str]:
-        for name, (hx, hy) in rect.handle_positions().items():
+    def _hit_handle(self, shape: DrawObject, sx: float, sy: float) -> Optional[str]:
+        for name, (hx, hy) in shape.handle_positions().items():
             screen_hx, screen_hy = self._world_to_screen(hx, hy)
             if math.hypot(sx - screen_hx, sy - screen_hy) <= self._handle_hit_radius(name):
                 return name
@@ -907,6 +1073,14 @@ class DrawingCanvas(tk.Canvas):
             self._redraw()
 
     def _on_motion(self, event: tk.Event) -> None:
+        if (
+            self.draw_tool == "triangle"
+            and self._triangle_vertices
+            and not self._drag_mode
+            and not self._picker_mode
+        ):
+            self._show_triangle_build_preview(event.x, event.y)
+
         if self._picker_mode or self._drag_mode:
             self._update_hovered_handle(None)
             return
@@ -919,17 +1093,17 @@ class DrawingCanvas(tk.Canvas):
     def _on_leave(self, _event: tk.Event) -> None:
         self._update_hovered_handle(None)
 
-    def _hit_rect(self, wx: float, wy: float) -> Optional[Rectangle]:
-        for rect in reversed(self._sorted_rects()):
-            if rect.contains_point(wx, wy):
-                return rect
+    def _hit_shape(self, wx: float, wy: float) -> Optional[DrawObject]:
+        for shape in reversed(sorted_shapes(self.shapes)):
+            if shape.contains_point(wx, wy):
+                return shape
         return None
 
     def _on_left_press(self, event: tk.Event) -> None:
         px, py = self._screen_to_world(event.x, event.y)
 
         if self._picker_mode:
-            hit = self._hit_rect(px, py)
+            hit = self._hit_shape(px, py)
             if hit:
                 self.on_pick_color(hit.color)
             return
@@ -941,25 +1115,30 @@ class DrawingCanvas(tk.Canvas):
             if handle:
                 self._drag_mode = handle
                 self._drag_start = (px, py)
-                self._drag_rect_snapshot = replace(selected)
+                self._drag_snapshot = replace(selected)
                 return
 
-        hit = self._hit_rect(px, py)
+        hit = self._hit_shape(px, py)
         if hit:
             self.select(hit.id)
             self._drag_mode = "move"
             self._drag_start = (px, py)
-            self._drag_rect_snapshot = replace(hit)
+            self._drag_snapshot = replace(hit)
             return
 
         self.select(None)
 
     def _on_right_press(self, event: tk.Event) -> None:
         px, py = self._screen_to_world(event.x, event.y)
+        if self.draw_tool == "triangle":
+            self._add_triangle_vertex(px, py)
+            return
         self._draw_start = (px, py)
         self._drag_mode = "draw"
 
     def _on_right_drag(self, event: tk.Event) -> None:
+        if self.draw_tool == "triangle":
+            return
         if self._drag_mode != "draw" or not self._draw_start:
             return
         px, py = self._screen_to_world(event.x, event.y)
@@ -968,37 +1147,84 @@ class DrawingCanvas(tk.Canvas):
         sx2, sy2 = self._world_to_screen(px, py)
         if self._preview_id:
             self.delete(self._preview_id)
-        self._preview_id = self.create_rectangle(
-            sx1,
-            sy1,
-            sx2,
-            sy2,
-            outline=DRAW_PREVIEW_OUTLINE,
-            dash=(4, 4),
-            width=1,
-        )
+        if self.draw_tool == "line":
+            self._preview_id = self.create_line(
+                sx1,
+                sy1,
+                sx2,
+                sy2,
+                fill=DRAW_PREVIEW_OUTLINE,
+                dash=(4, 4),
+                width=1,
+            )
+        else:
+            self._preview_id = self.create_rectangle(
+                sx1,
+                sy1,
+                sx2,
+                sy2,
+                outline=DRAW_PREVIEW_OUTLINE,
+                dash=(4, 4),
+                width=1,
+            )
 
     def _on_left_drag(self, event: tk.Event) -> None:
         if self._picker_mode:
             return
         px, py = self._screen_to_world(event.x, event.y)
 
-        rect = self.get_selected()
-        if not rect or not self._drag_start or not self._drag_rect_snapshot:
+        shape = self.get_selected()
+        if not shape or not self._drag_start or not self._drag_snapshot:
             return
 
         sx, sy = self._drag_start
-        snap = self._drag_rect_snapshot
+        snap = self._drag_snapshot
 
-        if self._drag_mode == "move":
-            rect.cx = snap.cx + (px - sx)
-            rect.cy = snap.cy + (py - sy)
-        elif self._drag_mode == "rotate":
-            rect.rotation = math.degrees(
-                math.atan2(py - rect.cy, px - rect.cx)
-            ) + 90
-        elif self._drag_mode in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
-            self._resize_from_handle(rect, snap, self._drag_mode, px, py)
+        if isinstance(shape, Line):
+            if self._drag_mode == "move":
+                dx, dy = px - sx, py - sy
+                shape.x1 = snap.x1 + dx
+                shape.y1 = snap.y1 + dy
+                shape.x2 = snap.x2 + dx
+                shape.y2 = snap.y2 + dy
+            elif self._drag_mode == "p1":
+                shape.x1, shape.y1 = px, py
+            elif self._drag_mode == "p2":
+                shape.x2, shape.y2 = px, py
+            else:
+                return
+        elif isinstance(shape, Rectangle):
+            if self._drag_mode == "move":
+                shape.cx = snap.cx + (px - sx)
+                shape.cy = snap.cy + (py - sy)
+            elif self._drag_mode == "rotate":
+                shape.rotation = math.degrees(
+                    math.atan2(py - shape.cy, px - shape.cx)
+                ) + 90
+            elif self._drag_mode in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
+                self._resize_from_handle(shape, snap, self._drag_mode, px, py)
+            else:
+                return
+        elif isinstance(shape, Triangle):
+            if self._drag_mode == "move":
+                dx, dy = px - sx, py - sy
+                shape.x1 = snap.x1 + dx
+                shape.y1 = snap.y1 + dy
+                shape.x2 = snap.x2 + dx
+                shape.y2 = snap.y2 + dy
+                shape.x3 = snap.x3 + dx
+                shape.y3 = snap.y3 + dy
+            elif self._drag_mode == "v1":
+                shape.x1, shape.y1 = px, py
+            elif self._drag_mode == "v2":
+                shape.x2, shape.y2 = px, py
+            elif self._drag_mode == "v3":
+                shape.x3, shape.y3 = px, py
+            elif self._drag_mode == "rotate":
+                target = math.degrees(math.atan2(py - snap.cy, px - snap.cx)) + 90
+                shape.rotate_to_angle(snap, target)
+            else:
+                return
         else:
             return
 
@@ -1042,34 +1268,61 @@ class DrawingCanvas(tk.Canvas):
         rect.height = bottom - top
 
     def _on_right_release(self, event: tk.Event) -> None:
+        if self.draw_tool == "triangle":
+            return
         if self._drag_mode == "draw" and self._draw_start:
             x1, y1 = self._draw_start
             x2, y2 = self._screen_to_world(event.x, event.y)
             if self._preview_id:
                 self.delete(self._preview_id)
                 self._preview_id = None
-            w, h = abs(x2 - x1), abs(y2 - y1)
-            if w >= MIN_RECT_SIZE and h >= MIN_RECT_SIZE:
-                ref_id = self.selected_id
-                on_layer = self.is_on_layer_draw() and ref_id is not None
-                z_index = self._z_index_above(ref_id) if on_layer else self._next_top_z_index()
-                rect = Rectangle(
-                    id=self._next_id,
-                    name=f"rect{self._next_name}",
-                    cx=(x1 + x2) / 2,
-                    cy=(y1 + y2) / 2,
-                    width=w,
-                    height=h,
-                    color=self.get_new_rect_color(),
-                    z_index=z_index,
-                )
-                self._next_id += 1
-                self._next_name += 1
-                self.rectangles.append(rect)
-                self.select(rect.id)
-                self.on_rects_change()
-                if on_layer:
-                    self.on_layer_draw_complete()
+            ref_id = self.selected_id
+            on_layer = self.is_on_layer_draw() and ref_id is not None
+            z_index = z_index_above(self.shapes, ref_id) if on_layer else next_top_z_index(self.shapes)
+            created = False
+
+            if self.draw_tool == "line":
+                length = math.hypot(x2 - x1, y2 - y1)
+                if length >= MIN_LINE_LENGTH:
+                    line = Line(
+                        id=self._next_id,
+                        name=f"line{self._next_line_name}",
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
+                        color=self.get_new_rect_color(),
+                        stroke_width=self._next_line_width,
+                        z_index=z_index,
+                    )
+                    self._next_id += 1
+                    self._next_line_name += 1
+                    self.shapes.append(line)
+                    self.select(line.id)
+                    self.on_rects_change()
+                    created = True
+            else:
+                w, h = abs(x2 - x1), abs(y2 - y1)
+                if w >= MIN_RECT_SIZE and h >= MIN_RECT_SIZE:
+                    rect = Rectangle(
+                        id=self._next_id,
+                        name=f"rect{self._next_rect_name}",
+                        cx=(x1 + x2) / 2,
+                        cy=(y1 + y2) / 2,
+                        width=w,
+                        height=h,
+                        color=self.get_new_rect_color(),
+                        z_index=z_index,
+                    )
+                    self._next_id += 1
+                    self._next_rect_name += 1
+                    self.shapes.append(rect)
+                    self.select(rect.id)
+                    self.on_rects_change()
+                    created = True
+
+            if created and on_layer:
+                self.on_layer_draw_complete()
             self._draw_start = None
 
         self._drag_mode = None
@@ -1084,7 +1337,7 @@ class DrawingCanvas(tk.Canvas):
 
         self._drag_mode = None
         self._drag_start = None
-        self._drag_rect_snapshot = None
+        self._drag_snapshot = None
         self._redraw()
 
     def _draw_paint_canvas_fill(self) -> None:
@@ -1113,28 +1366,24 @@ class DrawingCanvas(tk.Canvas):
         self.create_rectangle(0, top, left, bottom, fill=mask_color, outline="")
         self.create_rectangle(right, top, w, bottom, fill=mask_color, outline="")
 
-    def _should_draw_rect(self, rect: Rectangle) -> bool:
-        if not self.show_canvas_only:
-            return True
-        return self._rect_intersects_paint_canvas(rect)
-
-    def _redraw(self) -> None:
-        self.delete("all")
-        self._draw_paint_canvas_fill()
-
-        for rect in self._sorted_rects():
-            if not self._should_draw_rect(rect):
-                continue
-            screen_corners = [self._world_to_screen(x, y) for x, y in rect.corners()]
+    def _draw_shape(self, shape: DrawObject) -> None:
+        if isinstance(shape, Rectangle):
+            screen_corners = [self._world_to_screen(x, y) for x, y in shape.corners()]
             flat = [coord for pt in screen_corners for coord in pt]
-            self.create_polygon(*flat, fill=rect.color, outline="")
+            self.create_polygon(*flat, fill=shape.color, outline="")
+        elif isinstance(shape, Line):
+            sx1, sy1 = self._world_to_screen(shape.x1, shape.y1)
+            sx2, sy2 = self._world_to_screen(shape.x2, shape.y2)
+            width = max(1, int(shape.stroke_width * self._scale))
+            self.create_line(sx1, sy1, sx2, sy2, fill=shape.color, width=width, capstyle=tk.ROUND)
+        elif isinstance(shape, Triangle):
+            screen_verts = [self._world_to_screen(x, y) for x, y in shape.vertices()]
+            flat = [coord for pt in screen_verts for coord in pt]
+            self.create_polygon(*flat, fill=shape.color, outline="")
 
-        if self.show_canvas_only:
-            self._draw_outside_mask()
-
-        selected = self.get_selected()
-        if selected and self._should_draw_rect(selected):
-            corners = [self._world_to_screen(x, y) for x, y in selected.corners()]
+    def _draw_selection_handles(self, shape: DrawObject) -> None:
+        if isinstance(shape, Rectangle):
+            corners = [self._world_to_screen(x, y) for x, y in shape.corners()]
             for i in range(4):
                 x1, y1 = corners[i]
                 x2, y2 = corners[(i + 1) % 4]
@@ -1142,7 +1391,7 @@ class DrawingCanvas(tk.Canvas):
 
             handles = {
                 name: self._world_to_screen(hx, hy)
-                for name, (hx, hy) in selected.handle_positions().items()
+                for name, (hx, hy) in shape.handle_positions().items()
             }
             for name, (hx, hy) in handles.items():
                 fill = HANDLE_HOVER_FILL if name == self._hovered_handle else HANDLE_FILL
@@ -1176,14 +1425,104 @@ class DrawingCanvas(tk.Canvas):
                         fill=fill,
                         outline=HANDLE_OUTLINE,
                     )
+        elif isinstance(shape, Line):
+            handles = {
+                name: self._world_to_screen(hx, hy)
+                for name, (hx, hy) in shape.handle_positions().items()
+            }
+            mid = self._world_to_screen(shape.cx, shape.cy)
+            move = handles["move"]
+            self.create_line(mid[0], mid[1], move[0], move[1], fill=self.theme.selection_line, width=1)
+            for name in ("p1", "p2", "move"):
+                hx, hy = handles[name]
+                fill = HANDLE_HOVER_FILL if name == self._hovered_handle else HANDLE_FILL
+                radius = HANDLE_RADIUS if name != "move" else HANDLE_RADIUS + 2
+                self.create_oval(
+                    hx - radius,
+                    hy - radius,
+                    hx + radius,
+                    hy + radius,
+                    fill=fill,
+                    outline=HANDLE_OUTLINE,
+                )
+                if name == "move":
+                    self.create_text(
+                        hx,
+                        hy,
+                        text="✥",
+                        fill=HANDLE_TEXT,
+                        font=("Segoe UI", 10),
+                    )
+        elif isinstance(shape, Triangle):
+            corners = [self._world_to_screen(x, y) for x, y in shape.vertices()]
+            for i in range(3):
+                x1, y1 = corners[i]
+                x2, y2 = corners[(i + 1) % 3]
+                self.create_line(x1, y1, x2, y2, fill=self.theme.selection_line, width=1)
+
+            handles = {
+                name: self._world_to_screen(hx, hy)
+                for name, (hx, hy) in shape.handle_positions().items()
+            }
+            anchor = self._world_to_screen(*shape.reference_midpoint())
+            for name, (hx, hy) in handles.items():
+                fill = HANDLE_HOVER_FILL if name == self._hovered_handle else HANDLE_FILL
+                if name == "rotate":
+                    self.create_line(
+                        anchor[0], anchor[1], hx, hy, fill=self.theme.selection_line, width=1
+                    )
+                    radius = ROTATION_HANDLE_RADIUS
+                    self.create_oval(
+                        hx - radius,
+                        hy - radius,
+                        hx + radius,
+                        hy + radius,
+                        fill=fill,
+                        outline=HANDLE_OUTLINE,
+                    )
+                    self.create_text(
+                        hx,
+                        hy - 12,
+                        text="↻",
+                        fill=HANDLE_TEXT,
+                        font=("Segoe UI", 9),
+                    )
+                else:
+                    self.create_oval(
+                        hx - HANDLE_RADIUS,
+                        hy - HANDLE_RADIUS,
+                        hx + HANDLE_RADIUS,
+                        hy + HANDLE_RADIUS,
+                        fill=fill,
+                        outline=HANDLE_OUTLINE,
+                    )
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        self._draw_paint_canvas_fill()
+
+        for shape in sorted_shapes(self.shapes):
+            if not self._should_draw_shape(shape):
+                continue
+            self._draw_shape(shape)
+
+        if self.show_canvas_only:
+            self._draw_outside_mask()
+
+        selected = self.get_selected()
+        if selected and self._should_draw_shape(selected):
+            self._draw_selection_handles(selected)
 
         self._draw_paint_canvas_border()
+
+        if self._triangle_vertices:
+            self._show_triangle_build_preview()
 
 
 class DrawingApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("Rectangle Drawing Tool")
+        self.root.title("Drawing Tool")
         self.root.geometry("1100x650")
         self.root.minsize(540, 360)
 
@@ -1197,11 +1536,15 @@ class DrawingApp:
         self._show_canvas_only_active = False
         self._dark_mode = False
         self.theme = LIGHT_THEME
+        self._rect_tool_btn: Optional[tk.Button] = None
+        self._line_tool_btn: Optional[tk.Button] = None
+        self._triangle_tool_btn: Optional[tk.Button] = None
 
         self.palette = ColorPalette(
             self.root,
             on_color_change=self._on_color_change,
             on_picker_toggle=self._on_picker_toggle,
+            on_line_width_change=self._on_line_width_change,
         )
         self.palette.grid(row=0, column=0, sticky="ns", padx=(8, 4), pady=8)
 
@@ -1242,6 +1585,18 @@ class DrawingApp:
         )
         self.on_layer_btn.pack(side="left", padx=4)
 
+        self.file_btn = tk.Menubutton(self.toolbar, text="File", relief=tk.RAISED, font=("Segoe UI", 9))
+        self.file_menu = tk.Menu(self.file_btn, tearoff=0)
+        self.file_btn.config(menu=self.file_menu)
+        self.file_menu.add_command(label="Open...", command=self._on_open)
+        self.file_menu.add_command(
+            label="Save",
+            command=self._on_save,
+            accelerator="Ctrl+S",
+        )
+        self.file_menu.add_command(label="Save As...", command=self._on_save_as)
+        self.file_btn.pack(side="left", padx=4)
+
         self.dark_mode_btn = tk.Button(
             self.toolbar,
             text="Dark Mode",
@@ -1265,6 +1620,33 @@ class DrawingApp:
         )
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
+        self.tool_frame = tk.Frame(self.canvas_frame, bd=1, relief=tk.GROOVE)
+        self._rect_tool_btn = tk.Button(
+            self.tool_frame,
+            text="Rectangle",
+            command=lambda: self._set_draw_tool("rectangle"),
+            font=("Segoe UI", 9),
+            relief=tk.SUNKEN,
+        )
+        self._rect_tool_btn.pack(side="left", padx=2, pady=2)
+        self._line_tool_btn = tk.Button(
+            self.tool_frame,
+            text="Line",
+            command=lambda: self._set_draw_tool("line"),
+            font=("Segoe UI", 9),
+            relief=tk.RAISED,
+        )
+        self._line_tool_btn.pack(side="left", padx=2, pady=2)
+        self._triangle_tool_btn = tk.Button(
+            self.tool_frame,
+            text="Triangle",
+            command=lambda: self._set_draw_tool("triangle"),
+            font=("Segoe UI", 9),
+            relief=tk.RAISED,
+        )
+        self._triangle_tool_btn.pack(side="left", padx=2, pady=2)
+        self.tool_frame.place(in_=self.canvas, x=6, y=6, anchor="nw")
+
         self.root.bind_all("<Alt_L>", self._on_alt_press)
         self.root.bind_all("<Alt_R>", self._on_alt_press)
         self.root.bind_all("<KeyRelease-Alt_L>", self._on_alt_release)
@@ -1273,6 +1655,8 @@ class DrawingApp:
         self.root.bind_all("<Control_R>", self._on_ctrl_press)
         self.root.bind_all("<KeyRelease-Control_L>", self._on_ctrl_release)
         self.root.bind_all("<KeyRelease-Control_R>", self._on_ctrl_release)
+        self.root.bind_all("<Control-s>", self._on_ctrl_s)
+        self.root.bind_all("<Control-S>", self._on_ctrl_s)
         self.root.bind_all("<Tab>", self._on_tab_press)
 
         self.layers = LayerPanel(
@@ -1284,46 +1668,217 @@ class DrawingApp:
         self.layers.grid(row=0, column=2, sticky="ns", padx=(4, 8), pady=8)
 
         self._syncing_color = False
+        self._current_file_path: Optional[str] = None
         self._apply_theme()
-        self._seed_demo_rects()
+        self._seed_demo_shapes()
+        self._setup_file_drop()
 
-    def _seed_demo_rects(self) -> None:
-        demos = [
+    def _setup_file_drop(self) -> None:
+        if not _HAS_FILE_DROP:
+            return
+
+        drop_targets = (self.root, self.canvas_frame, self.canvas, self.palette, self.layers)
+        for widget in drop_targets:
+            try:
+                windnd.hook_dropfiles(widget, func=_enqueue_dropped_files, force_unicode=True)
+            except OSError:
+                pass
+
+        self._poll_file_drop_queue()
+
+    def _poll_file_drop_queue(self) -> None:
+        try:
+            while True:
+                files = _FILE_DROP_QUEUE.get_nowait()
+                self._handle_dropped_files(files)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_file_drop_queue)
+
+    @staticmethod
+    def _decode_dropped_path(item: object) -> str:
+        if isinstance(item, bytes):
+            try:
+                return item.decode("utf-8")
+            except UnicodeDecodeError:
+                return item.decode("gbk")
+        return str(item).strip().strip("{}")
+
+    def _is_drawing_path(self, path: str) -> bool:
+        suffix = Path(path).suffix.lower()
+        return suffix in (FILE_EXTENSION.lower(), ".json")
+
+    def _open_path(self, path: str) -> None:
+        try:
+            doc = load_document(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Open Failed", f"Could not open drawing:\n{exc}", parent=self.root)
+            return
+
+        self._apply_loaded_document(doc)
+        self._current_file_path = path
+        self._update_window_title()
+
+    def _handle_dropped_files(self, files: list) -> None:
+        for item in files:
+            path = self._decode_dropped_path(item)
+            if self._is_drawing_path(path):
+                self._open_path(path)
+                return
+
+        if files:
+            messagebox.showwarning(
+                "Unsupported File",
+                f"Drop a {FILE_EXTENSION} file to open it.",
+                parent=self.root,
+            )
+
+    def _seed_demo_shapes(self) -> None:
+        demos: list[DrawObject] = [
             Rectangle(1, "rect1", 180, 420, 200, 70, 0, "#3b6fc7", 1),
             Rectangle(2, "rect2", 520, 340, 90, 220, -18, "#e8a87c", 2),
             Rectangle(3, "rect3", 300, 200, 55, 55, 0, "#5cb85c", 3),
             Rectangle(4, "rect4", 420, 130, 160, 45, 0, "#5bc0de", 4),
+            Line(5, "line1", 120, 280, 340, 180, "#e88c4a", DEFAULT_LINE_WIDTH, 5),
+            Triangle(6, "tri1", 600, 180, 680, 320, 520, 300, "#9b59b6", 6),
         ]
-        self.canvas.rectangles = demos
-        self.canvas._next_id = 5
-        self.canvas._next_name = 5
+        self.canvas.shapes = demos
+        self.canvas._next_id = 7
+        self.canvas._next_rect_name = 5
+        self.canvas._next_line_name = 2
+        self.canvas._next_triangle_name = 2
         self.canvas.select(2)
         self._on_rects_change()
 
-    def _on_selection_change(self, rect_id: Optional[int]) -> None:
-        rect = self.canvas.get_selected()
-        self.layers.set_rectangles(self.canvas.rectangles, rect_id)
-        self.layers.delete_btn.config(state="normal" if rect_id is not None else "disabled")
-        if rect_id is None:
+    def _build_document(self) -> dict:
+        return build_document(
+            shapes=self.canvas.shapes,
+            paint_canvas=self.canvas.paint_canvas,
+            next_id=self.canvas._next_id,
+            next_rect_name=self.canvas._next_rect_name,
+            next_line_name=self.canvas._next_line_name,
+            next_triangle_name=self.canvas._next_triangle_name,
+            next_line_width=self.canvas._next_line_width,
+            selected_id=self.canvas.selected_id,
+            draw_tool=self.canvas.draw_tool,
+        )
+
+    def _apply_loaded_document(self, doc: LoadedDocument) -> None:
+        self.canvas.import_document(doc)
+        self._set_draw_tool(doc.draw_tool)
+        self.width_entry.delete(0, tk.END)
+        self.width_entry.insert(0, str(int(self.canvas.paint_canvas.width)))
+        self.height_entry.delete(0, tk.END)
+        self.height_entry.insert(0, str(int(self.canvas.paint_canvas.height)))
+        self._on_selection_change(self.canvas.selected_id)
+        self._on_rects_change()
+
+    def _update_window_title(self) -> None:
+        if self._current_file_path:
+            name = Path(self._current_file_path).name
+            self.root.title(f"Drawing Tool — {name}")
+        else:
+            self.root.title("Drawing Tool")
+
+    def _write_document(self, path: str) -> bool:
+        try:
+            save_document(path, self._build_document())
+        except OSError as exc:
+            messagebox.showerror("Save Failed", f"Could not save drawing:\n{exc}", parent=self.root)
+            return False
+
+        self._current_file_path = path
+        self._update_window_title()
+        return True
+
+    def _on_save(self) -> None:
+        if not self._current_file_path:
+            self._on_save_as()
+            return
+        self._write_document(self._current_file_path)
+
+    def _on_save_as(self) -> None:
+        initial_dir = None
+        initial_file = None
+        if self._current_file_path:
+            current = Path(self._current_file_path)
+            initial_dir = str(current.parent)
+            initial_file = current.name
+
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save Drawing As",
+            defaultextension=FILE_EXTENSION,
+            filetypes=file_dialog_types(),
+            initialdir=initial_dir,
+            initialfile=initial_file,
+        )
+        if path:
+            self._write_document(path)
+
+    def _on_ctrl_s(self, event: tk.Event) -> Optional[str]:
+        if isinstance(event.widget, tk.Entry):
+            return None
+        if self._current_file_path:
+            self._on_save()
+        else:
+            self._on_save_as()
+        return "break"
+
+    def _on_open(self) -> None:
+        initial_dir = None
+        if self._current_file_path:
+            initial_dir = str(Path(self._current_file_path).parent)
+
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Open Drawing",
+            filetypes=file_dialog_types(),
+            initialdir=initial_dir,
+        )
+        if not path:
+            return
+        self._open_path(path)
+
+    def _set_draw_tool(self, tool: DrawTool) -> None:
+        self.canvas.set_draw_tool(tool)
+        if self._rect_tool_btn and self._line_tool_btn and self._triangle_tool_btn:
+            self._rect_tool_btn.config(relief=tk.SUNKEN if tool == "rectangle" else tk.RAISED)
+            self._line_tool_btn.config(relief=tk.SUNKEN if tool == "line" else tk.RAISED)
+            self._triangle_tool_btn.config(relief=tk.SUNKEN if tool == "triangle" else tk.RAISED)
+
+    def _on_selection_change(self, shape_id: Optional[int]) -> None:
+        shape = self.canvas.get_selected()
+        self.layers.set_shapes(self.canvas.shapes, shape_id)
+        self.layers.delete_btn.config(state="normal" if shape_id is not None else "disabled")
+        if shape_id is None:
             self._on_layer_button_armed = False
         self._update_on_layer_mode()
-        if rect and not self._syncing_color:
+        is_line = isinstance(shape, Line)
+        self.palette.set_line_width_controls_visible(is_line)
+        if is_line:
+            self.palette.set_line_width_value(shape.stroke_width)
+        if shape and not self._syncing_color:
             self._syncing_color = True
-            self.palette.set_color(rect.color)
+            self.palette.set_color(shape.color)
             self._syncing_color = False
+
+    def _on_line_width_change(self, width: float) -> None:
+        self.canvas.set_line_width(width)
+        self.layers.set_shapes(self.canvas.shapes, self.canvas.selected_id)
 
     def _on_color_change(self, hex_color: str) -> None:
         if self._syncing_color:
             return
         self.canvas.set_color(hex_color)
-        self.layers.set_rectangles(self.canvas.rectangles, self.canvas.selected_id)
+        self.layers.set_shapes(self.canvas.shapes, self.canvas.selected_id)
 
-    def _on_layer_select(self, rect_id: int) -> None:
-        self.canvas.select(rect_id)
-        self._on_selection_change(rect_id)
+    def _on_layer_select(self, shape_id: int) -> None:
+        self.canvas.select(shape_id)
+        self._on_selection_change(shape_id)
 
     def _on_rects_change(self) -> None:
-        self.layers.set_rectangles(self.canvas.rectangles, self.canvas.selected_id)
+        self.layers.set_shapes(self.canvas.shapes, self.canvas.selected_id)
 
     def _on_delete(self) -> None:
         self.canvas.delete_selected()
@@ -1385,7 +1940,7 @@ class DrawingApp:
         self.palette.set_color(hex_color)
         self._syncing_color = False
         self.canvas.set_color(hex_color)
-        self.layers.set_rectangles(self.canvas.rectangles, self.canvas.selected_id)
+        self.layers.set_shapes(self.canvas.shapes, self.canvas.selected_id)
 
     def _on_paint_size_apply(self, _event: Optional[tk.Event] = None) -> None:
         try:
@@ -1428,12 +1983,19 @@ class DrawingApp:
         self.root.config(bg=self.theme.app_bg)
         self.canvas_frame.config(bg=self.theme.app_bg)
         self.toolbar.config(bg=self.theme.app_bg)
+        self.tool_frame.config(bg=self.theme.app_bg)
         for label in (self.width_label, self.height_label):
             label.config(bg=self.theme.app_bg, fg=self.theme.text)
         for entry in (self.width_entry, self.height_entry):
             _style_entry(entry, self.theme)
         for btn in (self.show_canvas_btn, self.on_layer_btn, self.dark_mode_btn):
             _style_button(btn, self.theme)
+        _style_menubutton(self.file_btn, self.theme)
+        _style_menu(self.file_menu, self.theme)
+        if self._rect_tool_btn and self._line_tool_btn and self._triangle_tool_btn:
+            for btn in (self._rect_tool_btn, self._line_tool_btn, self._triangle_tool_btn):
+                _style_button(btn, self.theme)
+        self.tool_frame.config(bg=self.theme.panel_bg)
         self._update_on_layer_mode()
         self.dark_mode_btn.config(
             text="Light Mode" if self._dark_mode else "Dark Mode",
