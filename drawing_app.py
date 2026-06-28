@@ -41,6 +41,17 @@ from drawing_file import (
     load_document,
     save_document,
 )
+from canvas_render import (
+    ColorVisMode,
+    RenderContext,
+    draw_outside_mask,
+    draw_paint_canvas_border,
+    draw_paint_canvas_fill,
+    draw_shape,
+    hex_to_rgb,
+    rgb_to_hex,
+)
+from lab_palette import LabColorPicker
 
 try:
     import windnd
@@ -221,15 +232,6 @@ class PaintCanvas:
         return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
 
 
-def rgb_to_hex(r: int, g: int, b: int) -> str:
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    hex_color = hex_color.lstrip("#")
-    return int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-
-
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -367,7 +369,7 @@ class ColorPalette(tk.Frame):
         self._cached_hue: Optional[float] = None
 
         self.picker_frame = tk.Frame(self)
-        self.picker_frame.pack(pady=(12, 8))
+        self.picker_frame.pack(pady=(4, 4))
 
         self.wheel_canvas = tk.Canvas(
             self.picker_frame,
@@ -392,11 +394,14 @@ class ColorPalette(tk.Frame):
         self.square_canvas.bind("<Button-1>", self._on_square_click)
         self.square_canvas.bind("<B1-Motion>", self._on_square_click)
 
-        self.preview = tk.Canvas(self, width=200, height=28, highlightthickness=0)
-        self.preview.pack(pady=(4, 6))
+        self.preview = tk.Canvas(self, width=80, height=18, highlightthickness=0)
+        self.preview.pack(pady=(0, 0))
+
+        self.lab_picker = LabColorPicker(self, on_change=self._on_lab_change)
+        self.lab_picker.pack(pady=(0, 2))
 
         self.picker_row = tk.Frame(self)
-        self.picker_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.picker_row.pack(fill="x", padx=10, pady=(2, 6))
         self.picker_btn = tk.Button(
             self.picker_row,
             text="Pick Color (hold Alt)",
@@ -445,6 +450,10 @@ class ColorPalette(tk.Frame):
         self._update_markers()
         self._sync_sliders_from_hsv()
         self.apply_theme(LIGHT_THEME)
+        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
+
+    def _sync_lab_picker(self) -> None:
+        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
 
     def apply_theme(self, theme: Theme) -> None:
         self.theme = theme
@@ -458,6 +467,13 @@ class ColorPalette(tk.Frame):
         for slider in self.sliders.values():
             slider.apply_theme(theme)
         self.line_width_slider.apply_theme(theme)
+        self.lab_picker.apply_theme(
+            theme.panel_bg,
+            theme.text,
+            theme.slider_outline,
+            theme.thumb_fill,
+            theme.thumb_outline,
+        )
         self._cached_hue = None
         self._build_wheel_image()
         self._refresh_sv_square()
@@ -475,6 +491,7 @@ class ColorPalette(tk.Frame):
         self._update_markers()
         self._sync_sliders_from_hsv()
         self._draw_preview(hex_color)
+        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
         self._updating = False
 
     def set_picker_active(self, active: bool) -> None:
@@ -491,6 +508,17 @@ class ColorPalette(tk.Frame):
 
     def _on_line_width_slider(self, value: float) -> None:
         self.on_line_width_change(value)
+
+    def _on_lab_change(self) -> None:
+        if self._updating:
+            return
+        self.r, self.g, self.b = self.lab_picker.get_rgb()
+        self.hue, self.sat, self.val = colorsys.rgb_to_hsv(
+            self.r / 255, self.g / 255, self.b / 255
+        )
+        self._sync_sliders_from_hsv()
+        self._update_markers()
+        self._emit_color()
 
     def _emit_color(self) -> None:
         if self._updating:
@@ -594,6 +622,7 @@ class ColorPalette(tk.Frame):
         if refresh_square:
             self._refresh_sv_square()
         self._update_markers()
+        self._sync_lab_picker()
         self._emit_color()
 
     def _slider_gradient(self, key: str) -> Callable[[float], tuple[int, int, int]]:
@@ -660,6 +689,7 @@ class ColorPalette(tk.Frame):
         if hue_changed:
             self._refresh_sv_square()
         self._update_markers()
+        self._sync_lab_picker()
         self._emit_color()
 
 
@@ -833,6 +863,7 @@ class DrawingCanvas(tk.Canvas):
 
         self.paint_canvas = PaintCanvas()
         self.show_canvas_only = False
+        self.color_vis_mode: ColorVisMode = "normal"
         self.apply_theme(LIGHT_THEME)
 
         self.bind("<Button-1>", self._on_left_press)
@@ -1034,6 +1065,18 @@ class DrawingCanvas(tk.Canvas):
     def set_show_canvas_only(self, active: bool) -> None:
         self.show_canvas_only = active
         self._redraw()
+
+    def set_color_vis_mode(self, mode: ColorVisMode) -> None:
+        self.color_vis_mode = mode
+        self._redraw()
+
+    def _render_context(self) -> RenderContext:
+        return RenderContext(
+            canvas=self,
+            world_to_screen=self._world_to_screen,
+            scale=self._scale,
+            color_mode=self.color_vis_mode,
+        )
 
     def import_document(self, doc: LoadedDocument) -> None:
         self._cancel_triangle_draw()
@@ -1341,45 +1384,22 @@ class DrawingCanvas(tk.Canvas):
         self._redraw()
 
     def _draw_paint_canvas_fill(self) -> None:
-        screen_corners = [self._world_to_screen(x, y) for x, y in self.paint_canvas.corners()]
-        flat = [coord for pt in screen_corners for coord in pt]
-        self.create_polygon(*flat, fill="white", outline="")
+        draw_paint_canvas_fill(self.paint_canvas, self._render_context())
 
     def _draw_paint_canvas_border(self) -> None:
-        screen_corners = [self._world_to_screen(x, y) for x, y in self.paint_canvas.corners()]
-        for i in range(4):
-            x1, y1 = screen_corners[i]
-            x2, y2 = screen_corners[(i + 1) % 4]
-            self.create_line(x1, y1, x2, y2, fill="black", width=1)
+        draw_paint_canvas_border(self.paint_canvas, self._render_context())
 
     def _draw_outside_mask(self) -> None:
-        x1, y1, x2, y2 = self.paint_canvas.bounds()
-        sx1, sy1 = self._world_to_screen(x1, y1)
-        sx2, sy2 = self._world_to_screen(x2, y2)
-        left, right = min(sx1, sx2), max(sx1, sx2)
-        top, bottom = min(sy1, sy2), max(sy1, sy2)
-        w = max(self.winfo_width(), 1)
-        h = max(self.winfo_height(), 1)
-        mask_color = self.theme.canvas_bg
-        self.create_rectangle(0, 0, w, top, fill=mask_color, outline="")
-        self.create_rectangle(0, bottom, w, h, fill=mask_color, outline="")
-        self.create_rectangle(0, top, left, bottom, fill=mask_color, outline="")
-        self.create_rectangle(right, top, w, bottom, fill=mask_color, outline="")
+        draw_outside_mask(
+            self.paint_canvas,
+            self._render_context(),
+            canvas_width=self.winfo_width(),
+            canvas_height=self.winfo_height(),
+            mask_color=self.theme.canvas_bg,
+        )
 
     def _draw_shape(self, shape: DrawObject) -> None:
-        if isinstance(shape, Rectangle):
-            screen_corners = [self._world_to_screen(x, y) for x, y in shape.corners()]
-            flat = [coord for pt in screen_corners for coord in pt]
-            self.create_polygon(*flat, fill=shape.color, outline="")
-        elif isinstance(shape, Line):
-            sx1, sy1 = self._world_to_screen(shape.x1, shape.y1)
-            sx2, sy2 = self._world_to_screen(shape.x2, shape.y2)
-            width = max(1, int(shape.stroke_width * self._scale))
-            self.create_line(sx1, sy1, sx2, sy2, fill=shape.color, width=width, capstyle=tk.ROUND)
-        elif isinstance(shape, Triangle):
-            screen_verts = [self._world_to_screen(x, y) for x, y in shape.vertices()]
-            flat = [coord for pt in screen_verts for coord in pt]
-            self.create_polygon(*flat, fill=shape.color, outline="")
+        draw_shape(shape, self._render_context())
 
     def _draw_selection_handles(self, shape: DrawObject) -> None:
         if isinstance(shape, Rectangle):
@@ -1534,7 +1554,8 @@ class DrawingApp:
         self._on_layer_button_armed = False
         self._ctrl_held = False
         self._show_canvas_only_active = False
-        self._dark_mode = False
+        self._color_vis_mode: ColorVisMode = "normal"
+        self._dark_mode = True
         self.theme = LIGHT_THEME
         self._rect_tool_btn: Optional[tk.Button] = None
         self._line_tool_btn: Optional[tk.Button] = None
@@ -1575,6 +1596,22 @@ class DrawingApp:
             font=("Segoe UI", 9),
         )
         self.show_canvas_btn.pack(side="left", padx=4)
+
+        self.brightness_vis_btn = tk.Button(
+            self.toolbar,
+            text="Brightness Vis",
+            command=self._toggle_brightness_vis,
+            font=("Segoe UI", 9),
+        )
+        self.brightness_vis_btn.pack(side="left", padx=4)
+
+        self.saturation_vis_btn = tk.Button(
+            self.toolbar,
+            text="Saturation Vis",
+            command=self._toggle_saturation_vis,
+            font=("Segoe UI", 9),
+        )
+        self.saturation_vis_btn.pack(side="left", padx=4)
 
         self.on_layer_btn = tk.Button(
             self.toolbar,
@@ -1958,6 +1995,24 @@ class DrawingApp:
         self.height_entry.delete(0, tk.END)
         self.height_entry.insert(0, str(int(self.canvas.paint_canvas.height)))
 
+    def _set_color_vis_mode(self, mode: ColorVisMode) -> None:
+        self._color_vis_mode = mode
+        self.canvas.set_color_vis_mode(mode)
+        self.brightness_vis_btn.config(relief=tk.SUNKEN if mode == "brightness" else tk.RAISED)
+        self.saturation_vis_btn.config(relief=tk.SUNKEN if mode == "saturation" else tk.RAISED)
+
+    def _toggle_brightness_vis(self) -> None:
+        if self._color_vis_mode == "brightness":
+            self._set_color_vis_mode("normal")
+        else:
+            self._set_color_vis_mode("brightness")
+
+    def _toggle_saturation_vis(self) -> None:
+        if self._color_vis_mode == "saturation":
+            self._set_color_vis_mode("normal")
+        else:
+            self._set_color_vis_mode("saturation")
+
     def _update_show_canvas_only(self) -> None:
         self.canvas.set_show_canvas_only(self._show_canvas_only_active)
         self.show_canvas_btn.config(
@@ -1988,7 +2043,13 @@ class DrawingApp:
             label.config(bg=self.theme.app_bg, fg=self.theme.text)
         for entry in (self.width_entry, self.height_entry):
             _style_entry(entry, self.theme)
-        for btn in (self.show_canvas_btn, self.on_layer_btn, self.dark_mode_btn):
+        for btn in (
+            self.show_canvas_btn,
+            self.brightness_vis_btn,
+            self.saturation_vis_btn,
+            self.on_layer_btn,
+            self.dark_mode_btn,
+        ):
             _style_button(btn, self.theme)
         _style_menubutton(self.file_btn, self.theme)
         _style_menu(self.file_menu, self.theme)
