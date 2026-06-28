@@ -3,4 +3,8 @@ test/
 
 __pycache__/
 
-build/
+.lab_lut_cache.gz
+
+build/main/
+
+build/RH1/
