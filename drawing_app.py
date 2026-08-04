@@ -11,7 +11,7 @@ import tkinter as tk
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from PIL import Image, ImageTk
 
@@ -51,7 +51,7 @@ from canvas_render import (
     hex_to_rgb,
     rgb_to_hex,
 )
-from lab_palette import LabColorPicker
+from lab_palette import LabColorPicker, OklchBarPicker, OklchRingPicker
 
 try:
     import windnd
@@ -341,34 +341,81 @@ class GradientSlider(tk.Frame):
         self.on_change(self._value)
 
 
+ColorMode = Literal["rgb", "hsv", "hsv_ring", "oklab", "oklch", "oklch_ring"]
+
+
 class ColorPalette(tk.Frame):
-    """Left panel: hue ring, SV square, and RGB/HSV sliders."""
+    """Left panel: multi-select RGB / HSV / OKLab / OKLCH color editors."""
 
     def __init__(
         self,
         master: tk.Misc,
         on_color_change: Callable[[str], None],
         on_picker_toggle: Callable[[], None],
-        on_line_width_change: Callable[[float], None],
     ) -> None:
         super().__init__(master, bg=LIGHT_THEME.panel_bg, width=220)
         self.on_color_change = on_color_change
-        self.on_line_width_change = on_line_width_change
         self._updating = False
         self.theme = LIGHT_THEME
+        self.color_modes: set[ColorMode] = {"hsv", "hsv_ring", "oklab"}
+        self._mode_order: tuple[ColorMode, ...] = (
+            "rgb",
+            "hsv",
+            "hsv_ring",
+            "oklab",
+            "oklch",
+            "oklch_ring",
+        )
 
-        self.hue = 0.55
-        self.sat = 0.65
-        self.val = 0.75
-        self.r, self.g, self.b = 74, 144, 217
+        self.hue = 0.058
+        self.sat = 0.79
+        self.val = 0.88
+        self.r, self.g, self.b = 225, 108, 45
 
-        self._wheel_size = 160
-        self._square_size = 72
+        self._wheel_size = 120
+        self._square_size = 60
         self._wheel_photo: Optional[ImageTk.PhotoImage] = None
         self._square_photo: Optional[ImageTk.PhotoImage] = None
         self._cached_hue: Optional[float] = None
 
-        self.picker_frame = tk.Frame(self)
+        self.mode_rows = tk.Frame(self)
+        self.mode_rows.pack(fill="x", padx=8, pady=(8, 4))
+        self.mode_row = tk.Frame(self.mode_rows)
+        self.mode_row.pack(fill="x")
+        self.mode_row2 = tk.Frame(self.mode_rows)
+        self.mode_row2.pack(fill="x", pady=(2, 0))
+        self.mode_buttons: dict[ColorMode, tk.Button] = {}
+        for mode, label, parent in (
+            ("rgb", "RGB", self.mode_row),
+            ("hsv", "HSV", self.mode_row),
+            ("hsv_ring", "Ring", self.mode_row),
+            ("oklab", "OKLab", self.mode_row2),
+            ("oklch", "OKLCH", self.mode_row2),
+            ("oklch_ring", "OKRing", self.mode_row2),
+        ):
+            btn = tk.Button(
+                parent,
+                text=label,
+                font=("Segoe UI", 8),
+                command=lambda m=mode: self.toggle_color_mode(m),
+            )
+            btn.pack(side="left", expand=True, fill="x", padx=1)
+            self.mode_buttons[mode] = btn
+
+        self.preview = tk.Canvas(self, width=200, height=28, highlightthickness=0)
+        self.preview.pack(pady=(2, 4))
+
+        self.mode_host = tk.Frame(self)
+        self.mode_host.pack(fill="x")
+
+        self.rgb_frame = tk.Frame(self.mode_host)
+        self.hsv_frame = tk.Frame(self.mode_host)
+        self.ring_frame = tk.Frame(self.mode_host)
+        self.oklab_frame = tk.Frame(self.mode_host)
+        self.oklch_frame = tk.Frame(self.mode_host)
+        self.oklch_ring_frame = tk.Frame(self.mode_host)
+
+        self.picker_frame = tk.Frame(self.ring_frame)
         self.picker_frame.pack(pady=(4, 4))
 
         self.wheel_canvas = tk.Canvas(
@@ -394,11 +441,14 @@ class ColorPalette(tk.Frame):
         self.square_canvas.bind("<Button-1>", self._on_square_click)
         self.square_canvas.bind("<B1-Motion>", self._on_square_click)
 
-        self.preview = tk.Canvas(self, width=80, height=18, highlightthickness=0)
-        self.preview.pack(pady=(0, 0))
-
-        self.lab_picker = LabColorPicker(self, on_change=self._on_lab_change)
-        self.lab_picker.pack(pady=(0, 2))
+        self.oklab_picker = LabColorPicker(self.oklab_frame, on_change=self._on_oklab_change)
+        self.oklab_picker.pack(pady=(0, 2))
+        self.oklch_picker = OklchBarPicker(self.oklch_frame, on_change=self._on_oklch_change)
+        self.oklch_picker.pack(pady=(0, 2))
+        self.oklch_ring_picker = OklchRingPicker(
+            self.oklch_ring_frame, on_change=self._on_oklch_ring_change
+        )
+        self.oklch_ring_picker.pack(pady=(0, 2))
 
         self.picker_row = tk.Frame(self)
         self.picker_row.pack(fill="x", padx=10, pady=(2, 6))
@@ -411,16 +461,16 @@ class ColorPalette(tk.Frame):
         self.picker_btn.pack(fill="x")
 
         self.sliders: dict[str, GradientSlider] = {}
-        for label, from_, to_, key in [
-            ("R", 0, 255, "r"),
-            ("G", 0, 255, "g"),
-            ("B", 0, 255, "b"),
-            ("H", 0, 360, "h"),
-            ("S", 0, 100, "s"),
-            ("V", 0, 100, "v"),
+        for label, from_, to_, key, parent in [
+            ("R", 0, 255, "r", self.rgb_frame),
+            ("G", 0, 255, "g", self.rgb_frame),
+            ("B", 0, 255, "b", self.rgb_frame),
+            ("H", 0, 360, "h", self.hsv_frame),
+            ("S", 0, 100, "s", self.hsv_frame),
+            ("V", 0, 100, "v", self.hsv_frame),
         ]:
             row = GradientSlider(
-                self,
+                parent,
                 label=label,
                 from_=from_,
                 to_=to_,
@@ -433,52 +483,87 @@ class ColorPalette(tk.Frame):
             lambda t: tuple(int(c * 255) for c in colorsys.hsv_to_rgb(t, 1, 1))
         )
 
-        self.line_width_slider = GradientSlider(
-            self,
-            label="W",
-            from_=MIN_LINE_WIDTH,
-            to_=MAX_LINE_WIDTH,
-            on_change=lambda v: self._on_line_width_slider(float(v)),
-        )
-        self.line_width_slider.set_gradient(
-            lambda t: (int(t * 180), int(t * 180), int(t * 180))
-        )
-        self.line_width_slider.set_value(DEFAULT_LINE_WIDTH)
-
         self._build_wheel_image()
         self._refresh_sv_square()
         self._update_markers()
         self._sync_sliders_from_hsv()
         self.apply_theme(LIGHT_THEME)
-        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
+        self._sync_ok_pickers()
+        self._apply_color_mode()
 
-    def _sync_lab_picker(self) -> None:
-        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
+    def _sync_ok_pickers(self) -> None:
+        self.oklab_picker.set_from_rgb(self.r, self.g, self.b)
+        self.oklch_picker.set_from_rgb(self.r, self.g, self.b)
+        self.oklch_ring_picker.set_from_rgb(self.r, self.g, self.b)
+
+    def toggle_color_mode(self, mode: ColorMode) -> None:
+        if mode in self.color_modes:
+            if len(self.color_modes) == 1:
+                return
+            self.color_modes.remove(mode)
+        else:
+            self.color_modes.add(mode)
+        self._apply_color_mode()
+
+    def _apply_color_mode(self) -> None:
+        frames = {
+            "rgb": self.rgb_frame,
+            "hsv": self.hsv_frame,
+            "hsv_ring": self.ring_frame,
+            "oklab": self.oklab_frame,
+            "oklch": self.oklch_frame,
+            "oklch_ring": self.oklch_ring_frame,
+        }
+        for frame in frames.values():
+            frame.pack_forget()
+        for mode in self._mode_order:
+            if mode in self.color_modes:
+                frames[mode].pack(fill="x")
+        for mode, btn in self.mode_buttons.items():
+            btn.config(relief=tk.SUNKEN if mode in self.color_modes else tk.RAISED)
 
     def apply_theme(self, theme: Theme) -> None:
         self.theme = theme
         self.config(bg=theme.panel_bg)
+        self.mode_rows.config(bg=theme.panel_bg)
+        self.mode_row.config(bg=theme.panel_bg)
+        self.mode_row2.config(bg=theme.panel_bg)
+        self.mode_host.config(bg=theme.panel_bg)
+        for frame in (
+            self.rgb_frame,
+            self.hsv_frame,
+            self.ring_frame,
+            self.oklab_frame,
+            self.oklch_frame,
+            self.oklch_ring_frame,
+        ):
+            frame.config(bg=theme.panel_bg)
         self.picker_frame.config(bg=theme.panel_bg)
         self.picker_row.config(bg=theme.panel_bg)
         self.wheel_canvas.config(bg=theme.panel_bg)
         self.square_canvas.config(bg=theme.panel_bg)
         self.preview.config(bg=theme.panel_bg)
+        for btn in self.mode_buttons.values():
+            _style_button(btn, theme)
         _style_button(self.picker_btn, theme)
         for slider in self.sliders.values():
             slider.apply_theme(theme)
-        self.line_width_slider.apply_theme(theme)
-        self.lab_picker.apply_theme(
+        theme_args = (
             theme.panel_bg,
             theme.text,
             theme.slider_outline,
             theme.thumb_fill,
             theme.thumb_outline,
         )
+        self.oklab_picker.apply_theme(*theme_args)
+        self.oklch_picker.apply_theme(*theme_args)
+        self.oklch_ring_picker.apply_theme(*theme_args)
         self._cached_hue = None
         self._build_wheel_image()
         self._refresh_sv_square()
         self._update_markers()
         self._draw_preview(rgb_to_hex(self.r, self.g, self.b))
+        self._apply_color_mode()
 
     def get_color(self) -> str:
         return rgb_to_hex(self.r, self.g, self.b)
@@ -491,34 +576,41 @@ class ColorPalette(tk.Frame):
         self._update_markers()
         self._sync_sliders_from_hsv()
         self._draw_preview(hex_color)
-        self.lab_picker.set_from_rgb(self.r, self.g, self.b)
+        self._sync_ok_pickers()
         self._updating = False
 
     def set_picker_active(self, active: bool) -> None:
         self.picker_btn.config(relief=tk.SUNKEN if active else tk.RAISED)
 
-    def set_line_width_controls_visible(self, visible: bool) -> None:
-        if visible:
-            self.line_width_slider.pack(fill="x", padx=10, pady=(0, 6))
-        else:
-            self.line_width_slider.pack_forget()
-
-    def set_line_width_value(self, width: float) -> None:
-        self.line_width_slider.set_value(width)
-
-    def _on_line_width_slider(self, value: float) -> None:
-        self.on_line_width_change(value)
-
-    def _on_lab_change(self) -> None:
+    def _apply_rgb_from_ok_picker(self, rgb: tuple[int, int, int]) -> None:
         if self._updating:
             return
-        self.r, self.g, self.b = self.lab_picker.get_rgb()
+        self.r, self.g, self.b = rgb
         self.hue, self.sat, self.val = colorsys.rgb_to_hsv(
             self.r / 255, self.g / 255, self.b / 255
         )
         self._sync_sliders_from_hsv()
+        self._refresh_sv_square()
         self._update_markers()
         self._emit_color()
+
+    def _on_oklab_change(self) -> None:
+        self._apply_rgb_from_ok_picker(self.oklab_picker.get_rgb())
+        if not self._updating:
+            self.oklch_picker.set_from_rgb(self.r, self.g, self.b)
+            self.oklch_ring_picker.set_from_rgb(self.r, self.g, self.b)
+
+    def _on_oklch_change(self) -> None:
+        self._apply_rgb_from_ok_picker(self.oklch_picker.get_rgb())
+        if not self._updating:
+            self.oklab_picker.set_from_rgb(self.r, self.g, self.b)
+            self.oklch_ring_picker.set_from_rgb(self.r, self.g, self.b)
+
+    def _on_oklch_ring_change(self) -> None:
+        self._apply_rgb_from_ok_picker(self.oklch_ring_picker.get_rgb())
+        if not self._updating:
+            self.oklab_picker.set_from_rgb(self.r, self.g, self.b)
+            self.oklch_picker.set_from_rgb(self.r, self.g, self.b)
 
     def _emit_color(self) -> None:
         if self._updating:
@@ -622,7 +714,7 @@ class ColorPalette(tk.Frame):
         if refresh_square:
             self._refresh_sv_square()
         self._update_markers()
-        self._sync_lab_picker()
+        self._sync_ok_pickers()
         self._emit_color()
 
     def _slider_gradient(self, key: str) -> Callable[[float], tuple[int, int, int]]:
@@ -689,7 +781,7 @@ class ColorPalette(tk.Frame):
         if hue_changed:
             self._refresh_sv_square()
         self._update_markers()
-        self._sync_lab_picker()
+        self._sync_ok_pickers()
         self._emit_color()
 
 
@@ -702,11 +794,26 @@ class LayerPanel(tk.Frame):
         on_select: Callable[[int], None],
         on_reorder: Callable[[], None],
         on_delete: Callable[[], None],
+        on_layout_change: Optional[Callable[[], None]] = None,
     ) -> None:
-        super().__init__(master, bg=LIGHT_THEME.panel_bg, width=160)
+        super().__init__(master, bg=LIGHT_THEME.panel_bg)
         self.theme = LIGHT_THEME
-        self.title_label = tk.Label(self, text="Layers", font=("Segoe UI", 10, "bold"))
-        self.title_label.pack(anchor="w", padx=10, pady=(12, 6))
+        self._list_visible = True
+        self.on_layout_change = on_layout_change
+
+        self.title_row = tk.Frame(self)
+        self.title_row.pack(fill="x", padx=8, pady=(12, 6))
+        self.title_label = tk.Label(self.title_row, text="Layers", font=("Segoe UI", 10, "bold"))
+        self.title_label.pack(side="left", anchor="w")
+        self.toggle_list_btn = tk.Button(
+            self.title_row,
+            text="◀",
+            width=2,
+            font=("Segoe UI", 8),
+            command=self.toggle_list,
+        )
+        self.toggle_list_btn.pack(side="right")
+
         self.btn_row = tk.Frame(self)
         self.btn_row.pack(fill="x", padx=8, pady=(0, 6))
         self.up_btn = tk.Button(self.btn_row, text="▲", width=3, command=lambda: self._move(-1))
@@ -727,12 +834,27 @@ class LayerPanel(tk.Frame):
         self._layer_order: list[int] = []
         self.apply_theme(LIGHT_THEME)
 
+    def is_list_visible(self) -> bool:
+        return self._list_visible
+
+    def toggle_list(self) -> None:
+        self._list_visible = not self._list_visible
+        if self._list_visible:
+            self._list_container.pack(fill="both", expand=True, padx=8, pady=4)
+            self.toggle_list_btn.config(text="◀")
+        else:
+            self._list_container.pack_forget()
+            self.toggle_list_btn.config(text="▶")
+        if self.on_layout_change:
+            self.on_layout_change()
+
     def apply_theme(self, theme: Theme) -> None:
         self.theme = theme
         self.config(bg=theme.panel_bg)
+        self.title_row.config(bg=theme.panel_bg)
         _style_label(self.title_label, theme)
         self.btn_row.config(bg=theme.panel_bg)
-        for btn in (self.up_btn, self.down_btn, self.delete_btn):
+        for btn in (self.up_btn, self.down_btn, self.delete_btn, self.toggle_list_btn):
             _style_button(btn, theme)
         self._list_container.config(bg=theme.list_bg, highlightbackground=theme.list_border)
         if self._shapes:
@@ -862,7 +984,7 @@ class DrawingCanvas(tk.Canvas):
         self._hovered_handle: Optional[str] = None
 
         self.paint_canvas = PaintCanvas()
-        self.show_canvas_only = False
+        self.show_canvas_only = True
         self.color_vis_mode: ColorVisMode = "normal"
         self.apply_theme(LIGHT_THEME)
 
@@ -1565,7 +1687,6 @@ class DrawingApp:
             self.root,
             on_color_change=self._on_color_change,
             on_picker_toggle=self._on_picker_toggle,
-            on_line_width_change=self._on_line_width_change,
         )
         self.palette.grid(row=0, column=0, sticky="ns", padx=(8, 4), pady=8)
 
@@ -1577,51 +1698,6 @@ class DrawingApp:
         self.toolbar = tk.Frame(self.canvas_frame)
         self.toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-        self.width_label = tk.Label(self.toolbar, text="Canvas Width:", font=("Segoe UI", 9))
-        self.width_label.pack(side="left", padx=(4, 2))
-        self.width_entry = tk.Entry(self.toolbar, width=7, font=("Consolas", 9))
-        self.width_entry.pack(side="left", padx=(0, 10))
-        self.width_entry.insert(0, str(int(DEFAULT_PAINT_WIDTH)))
-
-        self.height_label = tk.Label(self.toolbar, text="Height:", font=("Segoe UI", 9))
-        self.height_label.pack(side="left", padx=(0, 2))
-        self.height_entry = tk.Entry(self.toolbar, width=7, font=("Consolas", 9))
-        self.height_entry.pack(side="left", padx=(0, 10))
-        self.height_entry.insert(0, str(int(DEFAULT_PAINT_HEIGHT)))
-
-        self.show_canvas_btn = tk.Button(
-            self.toolbar,
-            text="Show Canvas Only (Tab)",
-            command=self._toggle_show_canvas_only,
-            font=("Segoe UI", 9),
-        )
-        self.show_canvas_btn.pack(side="left", padx=4)
-
-        self.brightness_vis_btn = tk.Button(
-            self.toolbar,
-            text="Brightness Vis",
-            command=self._toggle_brightness_vis,
-            font=("Segoe UI", 9),
-        )
-        self.brightness_vis_btn.pack(side="left", padx=4)
-
-        self.saturation_vis_btn = tk.Button(
-            self.toolbar,
-            text="Saturation Vis",
-            command=self._toggle_saturation_vis,
-            font=("Segoe UI", 9),
-        )
-        self.saturation_vis_btn.pack(side="left", padx=4)
-
-        self.on_layer_btn = tk.Button(
-            self.toolbar,
-            text="On Layer (Ctrl)",
-            command=self._on_on_layer_arm,
-            font=("Segoe UI", 9),
-            state="disabled",
-        )
-        self.on_layer_btn.pack(side="left", padx=4)
-
         self.file_btn = tk.Menubutton(self.toolbar, text="File", relief=tk.RAISED, font=("Segoe UI", 9))
         self.file_menu = tk.Menu(self.file_btn, tearoff=0)
         self.file_btn.config(menu=self.file_menu)
@@ -1632,7 +1708,74 @@ class DrawingApp:
             accelerator="Ctrl+S",
         )
         self.file_menu.add_command(label="Save As...", command=self._on_save_as)
-        self.file_btn.pack(side="left", padx=4)
+        self.file_btn.pack(side="left", padx=(4, 4))
+
+        self.size_btn = tk.Button(
+            self.toolbar,
+            text="Size",
+            command=self._toggle_size_panel,
+            font=("Segoe UI", 9),
+        )
+        self.size_btn.pack(side="left", padx=4)
+
+        self.size_panel = tk.Frame(self.toolbar, bd=1, relief=tk.GROOVE)
+        self.width_label = tk.Label(self.size_panel, text="W:", font=("Segoe UI", 9))
+        self.width_label.pack(side="left", padx=(4, 2))
+        self.width_entry = tk.Entry(self.size_panel, width=7, font=("Consolas", 9))
+        self.width_entry.pack(side="left", padx=(0, 6))
+        self.width_entry.insert(0, str(int(DEFAULT_PAINT_WIDTH)))
+        self.height_label = tk.Label(self.size_panel, text="H:", font=("Segoe UI", 9))
+        self.height_label.pack(side="left", padx=(0, 2))
+        self.height_entry = tk.Entry(self.size_panel, width=7, font=("Consolas", 9))
+        self.height_entry.pack(side="left", padx=(0, 4))
+        self.height_entry.insert(0, str(int(DEFAULT_PAINT_HEIGHT)))
+        self._size_panel_visible = False
+
+        self.show_canvas_btn = tk.Button(
+            self.toolbar,
+            text="Show Canvas Only (Tab)",
+            command=self._toggle_show_canvas_only,
+            font=("Segoe UI", 9),
+        )
+        self.show_canvas_btn.pack(side="left", padx=4)
+
+        self.vis_btn = tk.Menubutton(self.toolbar, text="Vis", relief=tk.RAISED, font=("Segoe UI", 9))
+        self.vis_menu = tk.Menu(self.vis_btn, tearoff=0)
+        self.vis_btn.config(menu=self.vis_menu)
+        self._vis_brightness_var = tk.BooleanVar(value=False)
+        self._vis_saturation_var = tk.BooleanVar(value=False)
+        self._vis_chroma_var = tk.BooleanVar(value=False)
+        self._vis_luminance_var = tk.BooleanVar(value=False)
+        self.vis_menu.add_checkbutton(
+            label="Brightness",
+            variable=self._vis_brightness_var,
+            command=self._on_vis_brightness,
+        )
+        self.vis_menu.add_checkbutton(
+            label="Saturation",
+            variable=self._vis_saturation_var,
+            command=self._on_vis_saturation,
+        )
+        self.vis_menu.add_checkbutton(
+            label="Chroma",
+            variable=self._vis_chroma_var,
+            command=self._on_vis_chroma,
+        )
+        self.vis_menu.add_checkbutton(
+            label="Luminance",
+            variable=self._vis_luminance_var,
+            command=self._on_vis_luminance,
+        )
+        self.vis_btn.pack(side="left", padx=4)
+
+        self.on_layer_btn = tk.Button(
+            self.toolbar,
+            text="On Layer (Ctrl)",
+            command=self._on_on_layer_arm,
+            font=("Segoe UI", 9),
+            state="disabled",
+        )
+        self.on_layer_btn.pack(side="left", padx=4)
 
         self.dark_mode_btn = tk.Button(
             self.toolbar,
@@ -1657,7 +1800,9 @@ class DrawingApp:
         )
         self.canvas.grid(row=1, column=0, sticky="nsew")
 
-        self.tool_frame = tk.Frame(self.canvas_frame, bd=1, relief=tk.GROOVE)
+        self.tools_host = tk.Frame(self.canvas_frame, bd=1, relief=tk.GROOVE)
+        self.tool_frame = tk.Frame(self.tools_host)
+        self.tool_frame.pack(side="top", fill="x", padx=2, pady=2)
         self._rect_tool_btn = tk.Button(
             self.tool_frame,
             text="Rectangle",
@@ -1665,7 +1810,7 @@ class DrawingApp:
             font=("Segoe UI", 9),
             relief=tk.SUNKEN,
         )
-        self._rect_tool_btn.pack(side="left", padx=2, pady=2)
+        self._rect_tool_btn.pack(side="left", padx=2, pady=1)
         self._line_tool_btn = tk.Button(
             self.tool_frame,
             text="Line",
@@ -1673,7 +1818,7 @@ class DrawingApp:
             font=("Segoe UI", 9),
             relief=tk.RAISED,
         )
-        self._line_tool_btn.pack(side="left", padx=2, pady=2)
+        self._line_tool_btn.pack(side="left", padx=2, pady=1)
         self._triangle_tool_btn = tk.Button(
             self.tool_frame,
             text="Triangle",
@@ -1681,8 +1826,24 @@ class DrawingApp:
             font=("Segoe UI", 9),
             relief=tk.RAISED,
         )
-        self._triangle_tool_btn.pack(side="left", padx=2, pady=2)
-        self.tool_frame.place(in_=self.canvas, x=6, y=6, anchor="nw")
+        self._triangle_tool_btn.pack(side="left", padx=2, pady=1)
+
+        self.width_frame = tk.Frame(self.tools_host)
+        self.line_width_slider = GradientSlider(
+            self.width_frame,
+            label="W",
+            from_=MIN_LINE_WIDTH,
+            to_=MAX_LINE_WIDTH,
+            on_change=lambda v: self._on_line_width_change(float(v)),
+        )
+        self.line_width_slider.set_gradient(
+            lambda t: (int(t * 180), int(t * 180), int(t * 180))
+        )
+        self.line_width_slider.set_value(DEFAULT_LINE_WIDTH)
+        self.line_width_slider.pack(padx=4, pady=(0, 4))
+        self._line_width_visible = False
+
+        self.tools_host.place(in_=self.canvas, x=6, y=6, anchor="nw")
 
         self.root.bind_all("<Alt_L>", self._on_alt_press)
         self.root.bind_all("<Alt_R>", self._on_alt_press)
@@ -1701,14 +1862,25 @@ class DrawingApp:
             on_select=self._on_layer_select,
             on_reorder=self._on_rects_change,
             on_delete=self._on_delete,
+            on_layout_change=self._update_layers_layout,
         )
         self.layers.grid(row=0, column=2, sticky="ns", padx=(4, 8), pady=8)
 
         self._syncing_color = False
         self._current_file_path: Optional[str] = None
         self._apply_theme()
-        self._seed_demo_shapes()
+        #self._seed_demo_shapes()
         self._setup_file_drop()
+
+    def _update_layers_layout(self) -> None:
+        if self.layers.is_list_visible():
+            self.layers.place_forget()
+            self.layers.grid(row=0, column=2, sticky="ns", padx=(4, 8), pady=8)
+        else:
+            # Remove the right column so the canvas expands; float compact controls.
+            self.layers.grid_remove()
+            self.layers.place(in_=self.canvas, relx=1.0, x=-8, y=6, anchor="ne")
+        self.root.update_idletasks()
 
     def _setup_file_drop(self) -> None:
         if not _HAS_FILE_DROP:
@@ -1892,13 +2064,20 @@ class DrawingApp:
             self._on_layer_button_armed = False
         self._update_on_layer_mode()
         is_line = isinstance(shape, Line)
-        self.palette.set_line_width_controls_visible(is_line)
+        self._set_line_width_controls_visible(is_line)
         if is_line:
-            self.palette.set_line_width_value(shape.stroke_width)
+            self.line_width_slider.set_value(shape.stroke_width)
         if shape and not self._syncing_color:
             self._syncing_color = True
             self.palette.set_color(shape.color)
             self._syncing_color = False
+
+    def _set_line_width_controls_visible(self, visible: bool) -> None:
+        self._line_width_visible = visible
+        if visible:
+            self.width_frame.pack(side="top", fill="x", padx=2, pady=(0, 2))
+        else:
+            self.width_frame.pack_forget()
 
     def _on_line_width_change(self, width: float) -> None:
         self.canvas.set_line_width(width)
@@ -1995,24 +2174,47 @@ class DrawingApp:
         self.height_entry.delete(0, tk.END)
         self.height_entry.insert(0, str(int(self.canvas.paint_canvas.height)))
 
+    def _toggle_size_panel(self) -> None:
+        self._size_panel_visible = not self._size_panel_visible
+        if self._size_panel_visible:
+            self.size_panel.pack(side="left", padx=4, after=self.size_btn)
+            self.size_btn.config(relief=tk.SUNKEN)
+        else:
+            self.size_panel.pack_forget()
+            self.size_btn.config(relief=tk.RAISED)
+
     def _set_color_vis_mode(self, mode: ColorVisMode) -> None:
         self._color_vis_mode = mode
         self.canvas.set_color_vis_mode(mode)
-        self.brightness_vis_btn.config(relief=tk.SUNKEN if mode == "brightness" else tk.RAISED)
-        self.saturation_vis_btn.config(relief=tk.SUNKEN if mode == "saturation" else tk.RAISED)
+        self._vis_brightness_var.set(mode == "brightness")
+        self._vis_saturation_var.set(mode == "saturation")
+        self._vis_chroma_var.set(mode == "chroma")
+        self._vis_luminance_var.set(mode == "luminance")
+        self.vis_btn.config(relief=tk.SUNKEN if mode != "normal" else tk.RAISED)
 
-    def _toggle_brightness_vis(self) -> None:
-        if self._color_vis_mode == "brightness":
-            self._set_color_vis_mode("normal")
-        else:
+    def _on_vis_brightness(self) -> None:
+        if self._vis_brightness_var.get():
             self._set_color_vis_mode("brightness")
-
-    def _toggle_saturation_vis(self) -> None:
-        if self._color_vis_mode == "saturation":
-            self._set_color_vis_mode("normal")
         else:
-            self._set_color_vis_mode("saturation")
+            self._set_color_vis_mode("normal")
 
+    def _on_vis_saturation(self) -> None:
+        if self._vis_saturation_var.get():
+            self._set_color_vis_mode("saturation")
+        else:
+            self._set_color_vis_mode("normal")
+
+    def _on_vis_chroma(self) -> None:
+        if self._vis_chroma_var.get():
+            self._set_color_vis_mode("chroma")
+        else:
+            self._set_color_vis_mode("normal")
+
+    def _on_vis_luminance(self) -> None:
+        if self._vis_luminance_var.get():
+            self._set_color_vis_mode("luminance")
+        else:
+            self._set_color_vis_mode("normal")
     def _update_show_canvas_only(self) -> None:
         self.canvas.set_show_canvas_only(self._show_canvas_only_active)
         self.show_canvas_btn.config(
@@ -2038,30 +2240,36 @@ class DrawingApp:
         self.root.config(bg=self.theme.app_bg)
         self.canvas_frame.config(bg=self.theme.app_bg)
         self.toolbar.config(bg=self.theme.app_bg)
-        self.tool_frame.config(bg=self.theme.app_bg)
+        self.tools_host.config(bg=self.theme.panel_bg)
+        self.tool_frame.config(bg=self.theme.panel_bg)
+        self.width_frame.config(bg=self.theme.panel_bg)
+        self.size_panel.config(bg=self.theme.app_bg, highlightbackground=self.theme.canvas_border)
         for label in (self.width_label, self.height_label):
             label.config(bg=self.theme.app_bg, fg=self.theme.text)
         for entry in (self.width_entry, self.height_entry):
             _style_entry(entry, self.theme)
         for btn in (
+            self.size_btn,
             self.show_canvas_btn,
-            self.brightness_vis_btn,
-            self.saturation_vis_btn,
             self.on_layer_btn,
             self.dark_mode_btn,
         ):
             _style_button(btn, self.theme)
         _style_menubutton(self.file_btn, self.theme)
         _style_menu(self.file_menu, self.theme)
+        _style_menubutton(self.vis_btn, self.theme)
+        _style_menu(self.vis_menu, self.theme)
         if self._rect_tool_btn and self._line_tool_btn and self._triangle_tool_btn:
             for btn in (self._rect_tool_btn, self._line_tool_btn, self._triangle_tool_btn):
                 _style_button(btn, self.theme)
-        self.tool_frame.config(bg=self.theme.panel_bg)
+        self.line_width_slider.apply_theme(self.theme)
         self._update_on_layer_mode()
         self.dark_mode_btn.config(
             text="Light Mode" if self._dark_mode else "Dark Mode",
             relief=tk.SUNKEN if self._dark_mode else tk.RAISED,
         )
+        self.size_btn.config(relief=tk.SUNKEN if self._size_panel_visible else tk.RAISED)
+        self.vis_btn.config(relief=tk.SUNKEN if self._color_vis_mode != "normal" else tk.RAISED)
         self.palette.apply_theme(self.theme)
         self.canvas.apply_theme(self.theme)
         self.layers.apply_theme(self.theme)

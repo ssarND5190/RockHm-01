@@ -180,7 +180,7 @@ class Line:
         }
 
     def contains_point(self, px: float, py: float) -> bool:
-        margin = max(self.stroke_width / 2, 4) + 4
+        margin = self.stroke_width / 2
         return _dist_point_to_segment(px, py, self.x1, self.y1, self.x2, self.y2) <= margin
 
 

@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --icon=ico/RH_logo.ico --name "RH1_02" main.py

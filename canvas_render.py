@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import colorsys
+import math
 import tkinter as tk
 from dataclasses import dataclass
 from typing import Callable, Literal
 
 from draw_objects import DrawObject, Line, Rectangle, Triangle
+from lab_color import C_MAX, rgb_to_oklch
 
-ColorVisMode = Literal["normal", "brightness", "saturation"]
+ColorVisMode = Literal["normal", "brightness", "saturation", "chroma", "luminance"]
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -25,6 +27,13 @@ def map_color(hex_color: str, mode: ColorVisMode) -> str:
     if mode == "normal":
         return hex_color
     r, g, b = hex_to_rgb(hex_color)
+    if mode in ("chroma", "luminance"):
+        l_val, chroma, _hue = rgb_to_oklch(r, g, b)
+        if mode == "luminance":
+            gray = int(round(max(0.0, min(1.0, l_val)) * 255))
+        else:
+            gray = int(round(max(0.0, min(1.0, chroma / C_MAX)) * 255))
+        return rgb_to_hex(gray, gray, gray)
     _h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
     if mode == "brightness":
         gray = int(round(v * 255))
@@ -65,16 +74,21 @@ def draw_rectangle(shape: Rectangle, ctx: RenderContext) -> None:
 def draw_line(shape: Line, ctx: RenderContext) -> None:
     sx1, sy1 = ctx.world_to_screen(shape.x1, shape.y1)
     sx2, sy2 = ctx.world_to_screen(shape.x2, shape.y2)
-    width = max(1, int(shape.stroke_width * ctx.scale))
-    ctx.canvas.create_line(
-        sx1,
-        sy1,
-        sx2,
-        sy2,
-        fill=map_color(shape.color, ctx.color_mode),
-        width=width,
-        capstyle=tk.ROUND,
-    )
+    dx, dy = sx2 - sx1, sy2 - sy1
+    length = math.hypot(dx, dy) or 1.0
+    half = max(0.5, shape.stroke_width * ctx.scale / 2)
+    nx, ny = -dy / length * half, dx / length * half
+    flat = [
+        sx1 + nx,
+        sy1 + ny,
+        sx1 - nx,
+        sy1 - ny,
+        sx2 - nx,
+        sy2 - ny,
+        sx2 + nx,
+        sy2 + ny,
+    ]
+    ctx.canvas.create_polygon(*flat, fill=map_color(shape.color, ctx.color_mode), outline="")
 
 
 def draw_triangle(shape: Triangle, ctx: RenderContext) -> None:
