@@ -30,7 +30,6 @@ from lab_color import (
     rgb_to_oklab,
     rgb_to_oklch,
     start_lab_lut_build,
-    try_load_lab_lut,
 )
 
 
@@ -207,19 +206,15 @@ class _LutClient:
         self._widget = widget
         self._on_ready = on_ready
         self.lut: Optional[LabColorLUT] = None
-        if try_load_lab_lut():
-            lut = peek_lab_lut()
-            if lut is not None:
-                self._on_ready(lut)
-                self.lut = lut
-                return
-        widget.after(50, self._begin)
-
-    def _begin(self) -> None:
-        if self.lut is not None:
+        # Never load the gzip/pickle cache on the UI thread — it can take hundreds
+        # of ms and freezes window construction. Warm on a worker and poll.
+        lut = peek_lab_lut()
+        if lut is not None:
+            self._on_ready(lut)
+            self.lut = lut
             return
         start_lab_lut_build()
-        self._poll()
+        widget.after(16, self._poll)
 
     def _poll(self) -> None:
         lut = peek_lab_lut()
@@ -227,7 +222,7 @@ class _LutClient:
             self.lut = lut
             self._on_ready(lut)
             return
-        self._widget.after(100, self._poll)
+        self._widget.after(50, self._poll)
 
 
 class LabColorPicker(tk.Frame):

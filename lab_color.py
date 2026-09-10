@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import gzip
 import math
+import os
 import pickle
+import shutil
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,8 +31,49 @@ HUE_LEVELS = 72
 GAMUT_STEPS = 120
 GAMUT_SEARCH_STEPS = 18
 
-_LUT_CACHE_PATH = Path(__file__).with_name(".oklab_lut_cache.gz")
+_LUT_CACHE_NAME = ".oklab_lut_cache.gz"
 _LUT_CACHE_VERSION = 1
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _writable_cache_paths() -> list[Path]:
+    """Locations where a rebuilt cache may be saved across launches."""
+    paths: list[Path] = []
+    if _is_frozen():
+        # Prefer next to the exe (portable). PyInstaller onefile's _MEIPASS is
+        # wiped each run, so never use that as the writable cache.
+        paths.append(Path(sys.executable).resolve().parent / _LUT_CACHE_NAME)
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            paths.append(Path(local) / "RH1" / _LUT_CACHE_NAME)
+    else:
+        paths.append(Path(__file__).resolve().with_name(_LUT_CACHE_NAME))
+    return paths
+
+
+def _readonly_cache_paths() -> list[Path]:
+    """Bundled / extracted caches used as a seed when no writable cache exists."""
+    paths: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(meipass) / _LUT_CACHE_NAME)
+    paths.append(Path(__file__).resolve().with_name(_LUT_CACHE_NAME))
+    return paths
+
+
+def _iter_cache_paths() -> list[Path]:
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in _writable_cache_paths() + _readonly_cache_paths():
+        resolved = path.resolve() if path.parent.exists() else path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(path)
+    return ordered
 
 # Linear sRGB -> LMS (OKLab M1).
 _M1 = (
@@ -315,13 +359,8 @@ def _cache_payload(lut: LabColorLUT) -> dict:
     }
 
 
-def _load_lut_cache() -> Optional[LabColorLUT]:
-    if not _LUT_CACHE_PATH.is_file():
-        return None
-    try:
-        with gzip.open(_LUT_CACHE_PATH, "rb") as handle:
-            payload = pickle.load(handle)
-    except (OSError, EOFError, pickle.UnpicklingError, KeyError, AttributeError):
+def _decode_lut_payload(payload: object) -> Optional[LabColorLUT]:
+    if not isinstance(payload, dict):
         return None
     if payload.get("version") != _LUT_CACHE_VERSION:
         return None
@@ -335,12 +374,90 @@ def _load_lut_cache() -> Optional[LabColorLUT]:
     return lut if isinstance(lut, LabColorLUT) else None
 
 
-def _save_lut_cache(lut: LabColorLUT) -> None:
+def _load_lut_cache_from(path: Path) -> Optional[LabColorLUT]:
+    if not path.is_file():
+        return None
     try:
-        with gzip.open(_LUT_CACHE_PATH, "wb") as handle:
-            pickle.dump(_cache_payload(lut), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        with gzip.open(path, "rb") as handle:
+            payload = pickle.load(handle)
+    except (OSError, EOFError, pickle.UnpicklingError, KeyError, AttributeError):
+        return None
+    return _decode_lut_payload(payload)
+
+
+def _load_lut_cache() -> Optional[LabColorLUT]:
+    lut, _ = _load_lut_cache_with_path()
+    return lut
+
+
+def _load_lut_cache_with_path() -> tuple[Optional[LabColorLUT], Optional[Path]]:
+    for path in _iter_cache_paths():
+        lut = _load_lut_cache_from(path)
+        if lut is not None:
+            return lut, path
+    return None, None
+
+
+def _is_under_writable_cache(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
     except OSError:
-        pass
+        resolved = path
+    for candidate in _writable_cache_paths():
+        try:
+            if candidate.resolve() == resolved:
+                return True
+        except OSError:
+            if candidate == path:
+                return True
+    return False
+
+
+def _has_writable_cache_file() -> bool:
+    for path in _writable_cache_paths():
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _copy_cache_to_writable(source: Path) -> None:
+    if _has_writable_cache_file():
+        return
+    for path in _writable_cache_paths():
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, tmp)
+            tmp.replace(path)
+            return
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+
+
+def _save_lut_cache(lut: LabColorLUT) -> None:
+    payload = _cache_payload(lut)
+    for path in _writable_cache_paths():
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # compresslevel=1: much faster than default 9; file stays ~same order of size.
+            with gzip.open(tmp, "wb", compresslevel=1) as handle:
+                pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.replace(path)
+            return
+        except (OSError, pickle.PicklingError):
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
 
 
 _LUT: Optional[LabColorLUT] = None
@@ -361,18 +478,20 @@ def _try_load_lut() -> bool:
 
 def get_lab_lut() -> LabColorLUT:
     global _LUT
-    if _try_load_lut():
-        return _LUT  # type: ignore[return-value]
     with _LUT_LOCK:
-        if _LUT is None:
-            _LUT = LabColorLUT.build()
-            _save_lut_cache(_LUT)
-    return _LUT
+        if _LUT is not None:
+            return _LUT
+        if _try_load_lut():
+            return _LUT  # type: ignore[return-value]
+        _LUT = LabColorLUT.build()
+        _save_lut_cache(_LUT)
+        return _LUT
 
 
 def start_lab_lut_build() -> None:
-    global _LUT, _LUT_BUILDING
-    if _try_load_lut() or _LUT_BUILDING:
+    """Load cache or rebuild LUT on a background thread (safe to call repeatedly)."""
+    global _LUT_BUILDING
+    if _LUT is not None or _LUT_BUILDING:
         return
     with _LUT_LOCK:
         if _LUT is not None or _LUT_BUILDING:
@@ -381,17 +500,30 @@ def start_lab_lut_build() -> None:
 
     def _worker() -> None:
         global _LUT, _LUT_BUILDING
-        lut = LabColorLUT.build()
-        _save_lut_cache(lut)
-        with _LUT_LOCK:
-            _LUT = lut
-            _LUT_BUILDING = False
+        try:
+            cached, source = _load_lut_cache_with_path()
+            if cached is not None:
+                with _LUT_LOCK:
+                    _LUT = cached
+                # Copy bundled/MEIPASS cache next to the exe (fast; no re-pickle).
+                if source is not None and not _is_under_writable_cache(source):
+                    _copy_cache_to_writable(source)
+                return
+            lut = LabColorLUT.build()
+            _save_lut_cache(lut)
+            with _LUT_LOCK:
+                _LUT = lut
+        finally:
+            with _LUT_LOCK:
+                _LUT_BUILDING = False
 
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, daemon=True, name="lab-lut-warm").start()
 
 
 def try_load_lab_lut() -> bool:
-    return _try_load_lut()
+    """Best-effort sync load. Prefer start_lab_lut_build() from the UI thread."""
+    with _LUT_LOCK:
+        return _try_load_lut()
 
 
 def peek_lab_lut() -> Optional[LabColorLUT]:

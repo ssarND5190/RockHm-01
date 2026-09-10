@@ -357,14 +357,14 @@ class ColorPalette(tk.Frame):
         self.on_color_change = on_color_change
         self._updating = False
         self.theme = LIGHT_THEME
-        self.color_modes: set[ColorMode] = {"hsv", "hsv_ring", "oklab"}
+        self.color_modes: set[ColorMode] = {"oklch", "oklch_ring", "oklab"}
         self._mode_order: tuple[ColorMode, ...] = (
             "rgb",
-            "hsv",
             "hsv_ring",
-            "oklab",
-            "oklch",
+            "hsv",
             "oklch_ring",
+            "oklch",
+            "oklab",
         )
 
         self.hue = 0.058
